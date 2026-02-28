@@ -8,7 +8,10 @@ def fetch_ohlcv(symbol, timeframe, limit=1000):
     exchange = ccxt.binance({'enableRateLimit': True})
     bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    
+    # Conversión de UTC a Hora Local (Colombia UTC-5)
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('America/Bogota')
     return df
 
 def calculate_atr_pct(df, period=14):
@@ -28,7 +31,6 @@ def get_fractal_extremes(df, tf, order=10):
 
     resistances = [(df['high'].iloc[i], tf) for i in local_max]
     supports = [(df['low'].iloc[i], tf) for i in local_min]
-    
     return supports, resistances
 
 def cluster_levels(levels, threshold_pct):
@@ -111,8 +113,6 @@ def scan_symbol(symbol, timeframes, limit, max_results):
 
     key_levels = cluster_levels(all_supports + all_resistances, threshold_pct=dynamic_threshold)
     current_price = fetch_ohlcv(symbol, timeframes[0], limit=1)['close'].iloc[0]
-    
-    # Aplicamos la nueva función format_price()
     print(f"Precio Actual: ${format_price(current_price)}\n")
     
     print(f"🧱 TOP {max_results} RESISTENCIAS MÁS CERCANAS (Hacia arriba):")
