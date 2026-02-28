@@ -11,6 +11,19 @@ def fetch_ohlcv(symbol, timeframe, limit=1000):
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
 
+def calculate_atr_pct(df, period=14):
+    """Calcula el ATR y lo devuelve como porcentaje del precio actual"""
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    
+    true_range = ranges.max(axis=1)
+    atr = true_range.rolling(period).mean()
+    # Retornamos qué porcentaje del precio representa la volatilidad
+    atr_pct = atr.iloc[-1] / df['close'].iloc[-1]
+    return atr_pct
+
 def get_fractal_extremes(df, tf, order=10):
     local_max = argrelextrema(df['high'].values, np.greater_equal, order=order)[0]
     local_min = argrelextrema(df['low'].values, np.less_equal, order=order)[0]
@@ -20,7 +33,7 @@ def get_fractal_extremes(df, tf, order=10):
     
     return supports, resistances
 
-def cluster_levels(levels, threshold_pct=0.008):
+def cluster_levels(levels, threshold_pct):
     if not levels: return []
     
     levels = sorted(levels, key=lambda x: x[0])
@@ -52,13 +65,26 @@ def cluster_levels(levels, threshold_pct=0.008):
                 'toques': len(c),
                 'confluencia': temporalidades,
                 'grosor_pct': width_pct,
-                'tipo_zona': "Línea exacta" if width_pct <= 0.3 else "Zona"
+                # Si el grosor es muy pequeño comparado al ATR, es una línea exacta
+                'tipo_zona': "Línea exacta" if width_pct <= (threshold_pct*100/2) else "Zona ancha"
             })
             
     return final_levels
 
 def scan_symbol(symbol, timeframes, limit, max_results):
-    print(f"\n--- 🎯 Muros Cuantitativos para {symbol} ---")
+    print(f"\n--- 🎯 Muros Cuantitativos Dinámicos (ATR) para {symbol} ---")
+    
+    # 1. Calcular la volatilidad real del activo usando el TF Diario
+    try:
+        daily_df = fetch_ohlcv(symbol, '1d', limit=60)
+        volatilidad_diaria_pct = calculate_atr_pct(daily_df, period=14)
+        # El umbral será 1/4 de la volatilidad diaria de esa moneda
+        dynamic_threshold = volatilidad_diaria_pct * 0.25 
+        print(f"Volatilidad Diaria (ATR): {volatilidad_diaria_pct*100:.2f}% | Umbral de Agrupación: {dynamic_threshold*100:.2f}%")
+    except Exception as e:
+        print(f"Error calculando ATR: {e}. Usando default 0.8%")
+        dynamic_threshold = 0.008
+
     print(f"Analizando confluencia en: {', '.join(timeframes)} | Velas por TF: {limit}")
     
     all_supports = []
@@ -79,7 +105,7 @@ def scan_symbol(symbol, timeframes, limit, max_results):
         except Exception as e:
             print(f"Error extrayendo {tf}: {e}")
 
-    key_levels = cluster_levels(all_supports + all_resistances, threshold_pct=0.008)
+    key_levels = cluster_levels(all_supports + all_resistances, threshold_pct=dynamic_threshold)
     current_price = fetch_ohlcv(symbol, timeframes[0], limit=1)['close'].iloc[0]
     print(f"Precio Actual: ${current_price:,.2f}\n")
     
@@ -103,7 +129,6 @@ def scan_symbol(symbol, timeframes, limit, max_results):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Escáner Quant de Soportes y Resistencias")
-    # Cambiado a --symbols con nargs="+"
     parser.add_argument("--symbols", nargs="+", required=True, help="Lista de símbolos, ej: BTC/USDT ETH/USDT")
     parser.add_argument("--tfs", nargs="+", default=['15m', '1h', '4h', '1d', '1w'], help="Temporalidades a escanear")
     parser.add_argument("--limit", type=int, default=1000, help="Velas históricas a analizar")
@@ -111,6 +136,5 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # Iteramos sobre la lista de monedas enviadas en el comando
     for symbol in args.symbols:
         scan_symbol(symbol, args.tfs, args.limit, args.max)
