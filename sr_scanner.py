@@ -103,10 +103,14 @@ def scan_symbol(symbol, timeframes, limit, max_results):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Escáner Quant de Soportes y Resistencias")
-    parser.add_argument("--symbol", type=str, required=True, help="El símbolo a analizar, ej: BTC/USDT")
-    parser.add_argument("--tfs", nargs="+", default=['15m', '1h', '4h', '1d', '1w'], help="Lista de temporalidades, ej: 1d 1w")
+    # Cambiado a --symbols con nargs="+"
+    parser.add_argument("--symbols", nargs="+", required=True, help="Lista de símbolos, ej: BTC/USDT ETH/USDT")
+    parser.add_argument("--tfs", nargs="+", default=['15m', '1h', '4h', '1d', '1w'], help="Temporalidades a escanear")
     parser.add_argument("--limit", type=int, default=1000, help="Velas históricas a analizar")
     parser.add_argument("--max", type=int, default=5, help="Número máximo de muros a mostrar por lado")
     
     args = parser.parse_args()
-    scan_symbol(args.symbol, args.tfs, args.limit, args.max)
+    
+    # Iteramos sobre la lista de monedas enviadas en el comando
+    for symbol in args.symbols:
+        scan_symbol(symbol, args.tfs, args.limit, args.max)
