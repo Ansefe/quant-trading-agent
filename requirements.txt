@@ -1,0 +1,7 @@
+pandas
+ccxt
+yfinance
+requests
+openai
+numpy
+scipy
