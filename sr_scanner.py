@@ -12,7 +12,6 @@ def fetch_ohlcv(symbol, timeframe, limit=1000):
     return df
 
 def calculate_atr_pct(df, period=14):
-    """Calcula el ATR y lo devuelve como porcentaje del precio actual"""
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
@@ -20,7 +19,6 @@ def calculate_atr_pct(df, period=14):
     
     true_range = ranges.max(axis=1)
     atr = true_range.rolling(period).mean()
-    # Retornamos qué porcentaje del precio representa la volatilidad
     atr_pct = atr.iloc[-1] / df['close'].iloc[-1]
     return atr_pct
 
@@ -65,20 +63,26 @@ def cluster_levels(levels, threshold_pct):
                 'toques': len(c),
                 'confluencia': temporalidades,
                 'grosor_pct': width_pct,
-                # Si el grosor es muy pequeño comparado al ATR, es una línea exacta
                 'tipo_zona': "Línea exacta" if width_pct <= (threshold_pct*100/2) else "Zona ancha"
             })
             
     return final_levels
 
+def format_price(price):
+    """Ajusta los decimales automáticamente según el valor de la moneda"""
+    if price < 0.001:
+        return f"{price:.8f}"
+    elif price < 1:
+        return f"{price:.4f}"
+    else:
+        return f"{price:,.2f}"
+
 def scan_symbol(symbol, timeframes, limit, max_results):
     print(f"\n--- 🎯 Muros Cuantitativos Dinámicos (ATR) para {symbol} ---")
     
-    # 1. Calcular la volatilidad real del activo usando el TF Diario
     try:
         daily_df = fetch_ohlcv(symbol, '1d', limit=60)
         volatilidad_diaria_pct = calculate_atr_pct(daily_df, period=14)
-        # El umbral será 1/4 de la volatilidad diaria de esa moneda
         dynamic_threshold = volatilidad_diaria_pct * 0.25 
         print(f"Volatilidad Diaria (ATR): {volatilidad_diaria_pct*100:.2f}% | Umbral de Agrupación: {dynamic_threshold*100:.2f}%")
     except Exception as e:
@@ -107,7 +111,9 @@ def scan_symbol(symbol, timeframes, limit, max_results):
 
     key_levels = cluster_levels(all_supports + all_resistances, threshold_pct=dynamic_threshold)
     current_price = fetch_ohlcv(symbol, timeframes[0], limit=1)['close'].iloc[0]
-    print(f"Precio Actual: ${current_price:,.2f}\n")
+    
+    # Aplicamos la nueva función format_price()
+    print(f"Precio Actual: ${format_price(current_price)}\n")
     
     print(f"🧱 TOP {max_results} RESISTENCIAS MÁS CERCANAS (Hacia arriba):")
     res_count = 0
@@ -115,7 +121,7 @@ def scan_symbol(symbol, timeframes, limit, max_results):
         if lvl['precio_linea'] > current_price and res_count < max_results:
             distancia = ((lvl['precio_linea'] - current_price) / current_price) * 100
             tfs_str = ", ".join(lvl['confluencia'])
-            print(f" 🔴 ${lvl['precio_linea']:,.2f} | A +{distancia:.1f}% | Toques: {lvl['toques']} | Confluencia: [{tfs_str}]")
+            print(f" 🔴 ${format_price(lvl['precio_linea'])} | A +{distancia:.1f}% | Toques: {lvl['toques']} | Confluencia: [{tfs_str}]")
             res_count += 1
 
     print(f"\n🛌 TOP {max_results} SOPORTES MÁS CERCANOS (Hacia abajo):")
@@ -124,7 +130,7 @@ def scan_symbol(symbol, timeframes, limit, max_results):
         if lvl['precio_linea'] < current_price and sup_count < max_results:
             distancia = ((current_price - lvl['precio_linea']) / current_price) * 100
             tfs_str = ", ".join(lvl['confluencia'])
-            print(f" 🟢 ${lvl['precio_linea']:,.2f} | A -{distancia:.1f}% | Toques: {lvl['toques']} | Confluencia: [{tfs_str}]")
+            print(f" 🟢 ${format_price(lvl['precio_linea'])} | A -{distancia:.1f}% | Toques: {lvl['toques']} | Confluencia: [{tfs_str}]")
             sup_count += 1
 
 if __name__ == "__main__":
