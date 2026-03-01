@@ -1,6 +1,5 @@
 # Variables de entorno y scripts con claves
 .env
-run_bot.sh
 
 # Logs
 cron.log
