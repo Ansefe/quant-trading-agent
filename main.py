@@ -57,7 +57,9 @@ def analyze_confluences(symbol, price, sentiment_list, sr_list, rsi_list, smc_li
             "score": score,
             "details": {
                 "support_level": soportes_cercanos[0]['price_level'],
+                "support_tf": soportes_cercanos[0]['confluence'],
                 "rsi_price": rsi_alcista[0]['price'],
+                "rsi_tf": [r['timeframe'] for r in rsi_alcista],
                 "sentiment": sentiment_status,
                 "fvg_magnet": True if fvg_arriba else False
             }
@@ -76,7 +78,9 @@ def analyze_confluences(symbol, price, sentiment_list, sr_list, rsi_list, smc_li
             "score": score,
             "details": {
                 "resistance_level": resistencias_cercanas[0]['price_level'],
+                "resistance_tf": resistencias_cercanas[0]['confluence'],
                 "rsi_price": rsi_bajista[0]['price'],
+                "rsi_tf": [r['timeframe'] for r in rsi_bajista],
                 "sentiment": sentiment_status,
                 "fvg_magnet": True if fvg_abajo else False
             }
@@ -108,24 +112,61 @@ def main():
         current_price = get_current_price(symbol)
         if not current_price: continue
             
-        print("\n[Paso 2] Escaneando Muros Cuantitativos ATR...")
-        sr_data = scan_sr(symbol, ['15m', '1h', '4h', '1d'], 1000, 5)
-        if sr_data: insert_sr_levels(sr_data)
+        print("\n[Paso 2] Escaneando Muros Cuantitativos ATR (por temporalidad)...")
+        
+        # ── Escaneo por temporalidad ──────────────────────────────────────────
+        # Cada TF corre de forma independiente: sus top-10 S/R se guardan
+        # con confluence=['15m'] (o lo que corresponda), así el frontend
+        # puede filtrar "solo 1W" o "solo 4h" sin contaminación de otras TFs.
+        # Después hacemos un escaneo multi-TF para detectar confluencias reales.
+        
+        TF_CONFIGS = {
+            '15m': {'limit': 500, 'top_n': 10},
+            '1h':  {'limit': 500, 'top_n': 10},
+            '4h':  {'limit': 500, 'top_n': 10},
+            '1d':  {'limit': 500, 'top_n': 10},
+            '1w':  {'limit': 500, 'top_n': 10},
+        }
+        
+        all_sr_data = []
+        for tf, cfg in TF_CONFIGS.items():
+            try:
+                tf_data = scan_sr(symbol, [tf], cfg['limit'], cfg['top_n'])
+                if tf_data:
+                    all_sr_data.extend(tf_data)
+                    print(f"   ✅ {tf}: {len(tf_data)} muros")
+                time.sleep(0.5)   # pequeña pausa entre TFs
+            except Exception as e:
+                print(f"   ⚠️ Error en SR/{tf}: {e}")
+        
+        # Escaneo multi-TF para confluencias (el "Santo Grial")
+        try:
+            multi_tf_data = scan_sr(symbol, list(TF_CONFIGS.keys()), 1000, 5)
+            if multi_tf_data:
+                # Marcamos que estos tienen confluencia multi-TF real
+                all_sr_data.extend(multi_tf_data)
+                print(f"   🏆 Multi-TF: {len(multi_tf_data)} confluencias detectadas")
+        except Exception as e:
+            print(f"   ⚠️ Error en SR/multi-TF: {e}")
+        
+        if all_sr_data:
+            insert_sr_levels(all_sr_data)
         
         time.sleep(1) # Rate limit protection
+
         
         print("\n[Paso 3] Escaneando Divergencias RSI...")
-        rsi_data = scan_rsi([symbol], ['15m', '1h', '4h'], historical=False)
+        rsi_data = scan_rsi([symbol], ['15m', '1h', '4h', '1d', '1w'], historical=False)
         if rsi_data: insert_rsi_divergences(rsi_data)
         
         time.sleep(1) # Rate limit protection
         
         print("\n[Paso 4] Escaneando Fair Value Gaps (SMC)...")
-        smc_data = scan_smc_levels([symbol], ['15m', '1h', '4h'], limit=500)
+        smc_data = scan_smc_levels([symbol], ['15m', '1h', '4h', '1d', '1w'], limit=500)
         if smc_data: insert_fvgs(smc_data)
         
         print("\n[Paso 5] Buscando Confluencias de Alta Probabilidad...")
-        confs = analyze_confluences(symbol, current_price, sentiment_data, sr_data or [], rsi_data or [], smc_data or [])
+        confs = analyze_confluences(symbol, current_price, sentiment_data, all_sr_data or [], rsi_data or [], smc_data or [])
         
         if confs:
             all_confluences.extend(confs)
