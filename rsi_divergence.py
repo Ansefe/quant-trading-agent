@@ -86,6 +86,7 @@ def check_divergences(df, order=5, historical=False, lookback_window=60):
     return sorted(unique_divs, key=lambda x: x['fecha'], reverse=True)
 
 def scan_market(symbols, timeframes, historical):
+    all_db_data = []
     for symbol in symbols:
         print(f"\n--- 🔎 Radar RSI (Lookback Dinámico) para {symbol} ---")
         found_any = False
@@ -100,16 +101,35 @@ def scan_market(symbols, timeframes, historical):
                     print(f"\n[{tf}] Resultados:")
                     for d in divs:
                         print(f"  {d['estado']} | {d['tipo']} el {d['fecha']} | Precio: ${d['precio']:,.2f} | RSI: {d['rsi']:,.1f}")
+                        all_db_data.append({
+                            "symbol": symbol,
+                            "timeframe": tf,
+                            "state": d['estado'],
+                            "type": d['tipo'],
+                            "price": float(d['precio']),
+                            "rsi": float(d['rsi']),
+                            "divergence_date": d['fecha']
+                        })
             except Exception as e:
                 print(f"Error procesando {tf}: {e}")
         if not found_any:
             print("✅ No hay divergencias macro detectadas con los parámetros actuales.")
+            
+    return all_db_data
 
 if __name__ == "__main__":
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from utils.db import insert_rsi_divergences
+
     parser = argparse.ArgumentParser(description="Escáner Quant de Divergencias RSI")
     parser.add_argument("--symbols", nargs="+", required=True, help="Lista de símbolos, ej: BTC/USDT ETH/USDT")
     parser.add_argument("--tfs", nargs="+", default=['15m', '1h', '4h', '1d'], help="Temporalidades a escanear")
     parser.add_argument("--historical", action="store_true", help="Muestra el backtesting histórico")
     
     args = parser.parse_args()
-    scan_market(args.symbols, args.tfs, args.historical)
+    data = scan_market(args.symbols, args.tfs, args.historical)
+    
+    if data:
+        insert_rsi_divergences(data)

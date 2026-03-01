@@ -5,3 +5,5 @@ requests
 openai
 numpy
 scipy
+supabase
+python-dotenv

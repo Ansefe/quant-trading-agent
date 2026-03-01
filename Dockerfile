@@ -14,8 +14,8 @@ COPY requirements.txt .
 # Instalamos las librerías financieras
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiamos nuestro script (el fetch_data.py que creamos antes)
-COPY fetch_data.py .
+# Copiamos todos los scripts y la carpeta utils
+COPY . .
 
-# Comando por defecto al encender el contenedor
-CMD ["python", "fetch_data.py"]
+# Comando por defecto al encender el contenedor (ejecuta el Orquestador con BTC y ETH por defecto)
+CMD ["python", "main.py", "--symbols", "BTC/USDT", "ETH/USDT"]

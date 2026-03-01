@@ -74,6 +74,7 @@ def format_price(price):
     else: return f"{price:,.2f}"
 
 def scan_smc(symbols, timeframes, limit):
+    all_db_data = []
     for symbol in symbols:
         print(f"\n--- 🐋 Radar SMC (Fair Value Gaps) para {symbol} ---")
         
@@ -106,21 +107,53 @@ def scan_smc(symbols, timeframes, limit):
 
                 for f in fvgs_arriba:
                     print(f"  {f['tipo']} | Creado: {f['fecha'].strftime('%Y-%m-%d %H:%M')} | Hueco: ${format_price(f['piso'])} - ${format_price(f['techo'])} | A +{f['distancia_pct']:.2f}%")
+                    all_db_data.append({
+                        "symbol": symbol,
+                        "timeframe": tf,
+                        "type": f['tipo'],
+                        "top_price": float(f['techo']),
+                        "bottom_price": float(f['piso']),
+                        "fvg_date": f['fecha'].strftime('%Y-%m-%d %H:%M:%S'),
+                        "mitigated": False,
+                        "center_price": float(f['centro']),
+                        "distance_pct": float(f['distancia_pct'])
+                    })
                 
                 if fvgs_arriba and fvgs_abajo:
                     print("  ------------------------------------------------")
 
                 for f in fvgs_abajo:
                     print(f"  {f['tipo']} | Creado: {f['fecha'].strftime('%Y-%m-%d %H:%M')} | Hueco: ${format_price(f['piso'])} - ${format_price(f['techo'])} | A {f['distancia_pct']:.2f}%")
+                    all_db_data.append({
+                        "symbol": symbol,
+                        "timeframe": tf,
+                        "type": f['tipo'],
+                        "top_price": float(f['techo']),
+                        "bottom_price": float(f['piso']),
+                        "fvg_date": f['fecha'].strftime('%Y-%m-%d %H:%M:%S'),
+                        "mitigated": False,
+                        "center_price": float(f['centro']),
+                        "distance_pct": float(f['distancia_pct'])
+                    })
                     
             except Exception as e:
                 print(f"Error procesando {tf}: {e}")
+                
+    return all_db_data
 
 if __name__ == "__main__":
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from utils.db import insert_fvgs
+
     parser = argparse.ArgumentParser(description="Escáner Quant SMC - Fair Value Gaps")
     parser.add_argument("--symbols", nargs="+", required=True, help="Lista de símbolos, ej: BTC/USDT")
     parser.add_argument("--tfs", nargs="+", default=['1h', '4h', '1d'], help="Temporalidades a escanear")
     parser.add_argument("--limit", type=int, default=500, help="Velas históricas a analizar")
     
     args = parser.parse_args()
-    scan_smc(args.symbols, args.tfs, args.limit)
+    data = scan_smc(args.symbols, args.tfs, args.limit)
+    
+    if data:
+        insert_fvgs(data)

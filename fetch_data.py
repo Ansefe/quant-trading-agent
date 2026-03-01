@@ -40,7 +40,7 @@ def send_telegram(text):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     requests.post(url, json=payload)
 
-def fetch_market_data():
+def fetch_market_data(send_alert=True):
     print("--- 📡 Recolectando Datos Estabilizados ---")
     market_context = ""
 
@@ -100,17 +100,37 @@ def fetch_market_data():
         analisis_final = json.loads(response.choices[0].message.content)
         
         mensaje = "📊 *Reporte Quant Estabilizado* 📊\n\n"
+        db_data = []
         for activo, datos in analisis_final.items():
             emoji = "🟢" if datos["sentimiento"] == "Alcista" else "🔴" if datos["sentimiento"] == "Bajista" else "🟡"
             mensaje += f"{emoji} *{activo}*\n"
             mensaje += f"Sentimiento: {datos['sentimiento']} ({datos['confianza']}%)\n"
             mensaje += f"Resumen: _{datos['resumen']}_\n\n"
             
-        send_telegram(mensaje)
-        print("¡Reporte enviado a Telegram!")
+            db_data.append({
+                "symbol": activo,
+                "sentiment": datos['sentimiento'],
+                "confidence": int(datos['confianza']),
+                "summary": datos['resumen']
+            })
+            
+        if send_alert:
+            send_telegram(mensaje)
+            print("¡Reporte enviado a Telegram!")
+            
+        return db_data
         
     except Exception as e:
         print(f"Error en IA: {e}")
+        return []
 
 if __name__ == "__main__":
-    fetch_market_data()
+    # Import locally to avoid circular dependency if needed, or just import at top
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from utils.db import insert_sentiment
+    
+    data = fetch_market_data(send_alert=True)
+    if data:
+        insert_sentiment(data)

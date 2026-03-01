@@ -117,11 +117,22 @@ def scan_symbol(symbol, timeframes, limit, max_results):
     
     print(f"🧱 TOP {max_results} RESISTENCIAS MÁS CERCANAS (Hacia arriba):")
     res_count = 0
+    db_data = []
+    
     for lvl in sorted(key_levels, key=lambda x: x['precio_linea']):
         if lvl['precio_linea'] > current_price and res_count < max_results:
             distancia = ((lvl['precio_linea'] - current_price) / current_price) * 100
             tfs_str = ", ".join(lvl['confluencia'])
             print(f" 🔴 ${format_price(lvl['precio_linea'])} | A +{distancia:.1f}% | Toques: {lvl['toques']} | Confluencia: [{tfs_str}]")
+            db_data.append({
+                "symbol": symbol,
+                "price_level": float(lvl['precio_linea']),
+                "touches": int(lvl['toques']),
+                "confluence": lvl['confluencia'],
+                "thickness_pct": float(lvl['grosor_pct']),
+                "zone_type": lvl['tipo_zona'],
+                "is_support": False
+            })
             res_count += 1
 
     print(f"\n🛌 TOP {max_results} SOPORTES MÁS CERCANOS (Hacia abajo):")
@@ -131,9 +142,25 @@ def scan_symbol(symbol, timeframes, limit, max_results):
             distancia = ((current_price - lvl['precio_linea']) / current_price) * 100
             tfs_str = ", ".join(lvl['confluencia'])
             print(f" 🟢 ${format_price(lvl['precio_linea'])} | A -{distancia:.1f}% | Toques: {lvl['toques']} | Confluencia: [{tfs_str}]")
+            db_data.append({
+                "symbol": symbol,
+                "price_level": float(lvl['precio_linea']),
+                "touches": int(lvl['toques']),
+                "confluence": lvl['confluencia'],
+                "thickness_pct": float(lvl['grosor_pct']),
+                "zone_type": lvl['tipo_zona'],
+                "is_support": True
+            })
             sup_count += 1
+            
+    return db_data
 
 if __name__ == "__main__":
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from utils.db import insert_sr_levels
+
     parser = argparse.ArgumentParser(description="Escáner Quant de Soportes y Resistencias")
     parser.add_argument("--symbols", nargs="+", required=True, help="Lista de símbolos, ej: BTC/USDT ETH/USDT")
     parser.add_argument("--tfs", nargs="+", default=['15m', '1h', '4h', '1d', '1w'], help="Temporalidades a escanear")
@@ -142,5 +169,10 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
+    all_db_data = []
     for symbol in args.symbols:
-        scan_symbol(symbol, args.tfs, args.limit, args.max)
+        data = scan_symbol(symbol, args.tfs, args.limit, args.max)
+        if data: all_db_data.extend(data)
+        
+    if all_db_data:
+        insert_sr_levels(all_db_data)
