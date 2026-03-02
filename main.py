@@ -1,5 +1,6 @@
 import argparse
 import time
+import datetime
 import ccxt
 from utils.db import (
     insert_sentiment,
@@ -121,11 +122,11 @@ def main():
         # Después hacemos un escaneo multi-TF para detectar confluencias reales.
         
         TF_CONFIGS = {
-            '15m': {'limit': 500, 'top_n': 10},
-            '1h':  {'limit': 500, 'top_n': 10},
-            '4h':  {'limit': 500, 'top_n': 10},
-            '1d':  {'limit': 500, 'top_n': 10},
-            '1w':  {'limit': 500, 'top_n': 10},
+            '15m': {'limit': 1000, 'top_n': 10},
+            '1h':  {'limit': 1000, 'top_n': 10},
+            '4h':  {'limit': 1000, 'top_n': 10},
+            '1d':  {'limit': 1000, 'top_n': 10},
+            '1w':  {'limit': 1000, 'top_n': 10},  # Binance devuelve lo disponible si hay menos
         }
         
         all_sr_data = []
@@ -133,19 +134,23 @@ def main():
             try:
                 tf_data = scan_sr(symbol, [tf], cfg['limit'], cfg['top_n'])
                 if tf_data:
+                    # Etiquetamos como escaneo aislado por TF
+                    for row in tf_data:
+                        row['source_run'] = 'per_tf'
                     all_sr_data.extend(tf_data)
                     print(f"   ✅ {tf}: {len(tf_data)} muros")
-                time.sleep(0.5)   # pequeña pausa entre TFs
+                time.sleep(0.5)
             except Exception as e:
                 print(f"   ⚠️ Error en SR/{tf}: {e}")
         
-        # Escaneo multi-TF para confluencias (el "Santo Grial")
+        # Escaneo multi-TF para detectar confluencias inter-temporalidad
         try:
             multi_tf_data = scan_sr(symbol, list(TF_CONFIGS.keys()), 1000, 5)
             if multi_tf_data:
-                # Marcamos que estos tienen confluencia multi-TF real
+                for row in multi_tf_data:
+                    row['source_run'] = 'multi_tf'
                 all_sr_data.extend(multi_tf_data)
-                print(f"   🏆 Multi-TF: {len(multi_tf_data)} confluencias detectadas")
+                print(f"   🏆 Multi-TF: {len(multi_tf_data)} confluencias")
         except Exception as e:
             print(f"   ⚠️ Error en SR/multi-TF: {e}")
         
@@ -177,19 +182,37 @@ def main():
             
         time.sleep(2) # Rate limit prevention between symbols
         
+    # ── Reporte final siempre se envía por Telegram ─────────────────────────
+    # Así siempre sabes que el bot corrió aunque no haya confluencias.
+    hora = datetime.datetime.now().strftime('%H:%M')
+    
     if all_confluences:
         insert_trade_confluences(all_confluences)
-        
-        # Enviar resumen maestro a Telegram
-        mensaje = "👑 *ALERTA DEL ORQUESTADOR QUANT* 👑\n\n"
+        mensaje = f"\ud83d\udc51 *ALERTA DEL ORQUESTADOR QUANT* ({hora}) \ud83d\udc51\n\n"
         for c in all_confluences:
-            emoji = "🚀" if c['setup_type'] == "LONG" else "🩸"
-            mensaje += f"{emoji} *{c['symbol']}* | SETUP: {c['setup_type']}\n"
-            mensaje += f"Puntuación: {c['score']}/10\n"
-            mensaje += f"Target (Imán FVG): ${c['target_price']:,.2f}\n"
-            mensaje += f"Detalles: {c['details']}\n\n"
-            
-        send_telegram(mensaje)
+            emoji = "\ud83d\ude80" if c['setup_type'] == 'LONG' else "\ud83e\ude78"
+            mensaje += f"{emoji} *{c['symbol']}* | {c['setup_type']} | Score {c['score']}/10\n"
+            if c.get('target_price'):
+                mensaje += f"   Target: ${c['target_price']:,.2f}\n"
+            support_or_res = c['details'].get('support_level') or c['details'].get('resistance_level')
+            if support_or_res:
+                mensaje += f"   Zona: ${support_or_res:,.2f}\n"
+            mensaje += f"   Sentimiento: {c['details'].get('sentiment', '-')}\n"
+            tfs = c['details'].get('support_tf') or c['details'].get('resistance_tf') or []
+            if tfs:
+                mensaje += f"   TFs: {', '.join(tfs)}\n"
+            mensaje += "\n"
+    else:
+        # Resumen de estado sin confluencias
+        symbols_str = ', '.join(args.symbols)
+        mensaje = (
+            f"\ud83d\udcca *Reporte Quant* ({hora})\n"
+            f"Activos: {symbols_str}\n"
+            f"Estado: Sin confluencias fuertes en este momento.\n"
+            f"Datos actualizados en Supabase \u2705"
+        )
+    
+    send_telegram(mensaje)
 
 if __name__ == "__main__":
     main()
