@@ -30,6 +30,10 @@ def insert_sr_levels(data_list):
     client = get_supabase_client()
     if not client or not data_list: return
     try:
+        # Clean stale data for this symbol before inserting fresh
+        symbol = data_list[0].get('symbol')
+        if symbol:
+            client.table("support_resistance_levels").delete().eq('symbol', symbol).execute()
         response = client.table("support_resistance_levels").insert(data_list).execute()
         print(f"✅ Supabase: Insertados {len(data_list)} muros (Soporte/Resistencia).")
     except Exception as e:
@@ -39,6 +43,9 @@ def insert_rsi_divergences(data_list):
     client = get_supabase_client()
     if not client or not data_list: return
     try:
+        symbol = data_list[0].get('symbol')
+        if symbol:
+            client.table("rsi_divergences").delete().eq('symbol', symbol).execute()
         response = client.table("rsi_divergences").insert(data_list).execute()
         print(f"✅ Supabase: Insertadas {len(data_list)} divergencias RSI.")
     except Exception as e:
@@ -48,16 +55,20 @@ def insert_fvgs(data_list):
     client = get_supabase_client()
     if not client or not data_list: return
     try:
+        symbol = data_list[0].get('symbol')
+        if symbol:
+            client.table("fair_value_gaps").delete().eq('symbol', symbol).execute()
         response = client.table("fair_value_gaps").insert(data_list).execute()
         print(f"✅ Supabase: Insertados {len(data_list)} FVGs.")
     except Exception as e:
         print(f"❌ Error insertando en fair_value_gaps: {e}")
 
 def insert_trade_confluences(data_list):
+    """Confluences are KEPT for backtesting — no cleanup here."""
     client = get_supabase_client()
     if not client or not data_list: return
     try:
         response = client.table("trade_confluences").insert(data_list).execute()
-        print(f"✅ Supabase: Insertadas {len(data_list)} CONFLUENCIAS.")
+        print(f"✅ Supabase: Insertadas {len(data_list)} CONFLUENCIAS (acumuladas para backtesting).")
     except Exception as e:
         print(f"❌ Error insertando en trade_confluences: {e}")

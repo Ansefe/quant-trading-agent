@@ -32,59 +32,91 @@ def analyze_confluences(symbol, price, sentiment_list, sr_list, rsi_list, smc_li
     sentiment_data = next((s for s in sentiment_list if s['symbol'] == symbol), {})
     sentiment_status = sentiment_data.get('sentiment', 'Neutral')
     
-    # 1. Filtramos Soportes y Resistencias cercanos (a menos del 2% del precio actual)
-    soportes_cercanos = [s for s in sr_list if s['is_support'] and ((price - s['price_level'])/price) < 0.02]
-    resistencias_cercanas = [r for r in sr_list if not r['is_support'] and ((r['price_level'] - price)/price) < 0.02]
+    # Proximity filter: 3% from current price (was 2% — too strict)
+    proximity = 0.03
     
-    # 2. Filtramos Divergencias RSI ACTIVAS
+    soportes_cercanos = [s for s in sr_list if s['is_support'] and abs(price - s['price_level'])/price < proximity]
+    resistencias_cercanas = [r for r in sr_list if not r['is_support'] and abs(r['price_level'] - price)/price < proximity]
+    
     rsi_alcista = [r for r in rsi_list if 'ALCISTA' in r['type'] and 'ACTIVA' in r['state']]
     rsi_bajista = [r for r in rsi_list if 'BAJISTA' in r['type'] and 'ACTIVA' in r['state']]
     
-    # 3. Filtramos FVGs como objetivos (Imanes por encima o por debajo)
-    fvg_arriba = [f for f in smc_list if f['center_price'] > price] # Objetivo para Long
-    fvg_abajo = [f for f in smc_list if f['center_price'] < price] # Objetivo para Short
+    fvg_arriba = [f for f in smc_list if f['center_price'] > price]
+    fvg_abajo = [f for f in smc_list if f['center_price'] < price]
     
-    # --- LÓGICA DE CONFLUENCIA LONG (COMPRA) ---
-    # Setup básico: El precio está en un soporte Y hay divergencia alcista Y el bot dice Alcista/Neutral
-    if soportes_cercanos and rsi_alcista and sentiment_status != "Bajista":
-        score = 8
-        target = fvg_arriba[0]['center_price'] if fvg_arriba else price * 1.05
-        if fvg_arriba: score = 10 # Santo Grial
-        
+    # --- LÓGICA DE CONFLUENCIA LONG (Score-based, no requirement for ALL conditions) ---
+    long_score = 0
+    long_details = {}
+    
+    if soportes_cercanos:
+        best_support = max(soportes_cercanos, key=lambda s: s.get('touches', 1))
+        long_score += 3 + min(2, len(best_support.get('confluence', [])))  # 3-5 pts for support
+        long_details['support_level'] = best_support['price_level']
+        long_details['support_tf'] = best_support.get('confluence', [])
+        long_details['support_touches'] = best_support.get('touches', 1)
+    
+    if rsi_alcista:
+        long_score += 3  # 3 pts for divergence
+        long_details['rsi_price'] = rsi_alcista[0].get('price')
+        long_details['rsi_tf'] = [r['timeframe'] for r in rsi_alcista]
+    
+    if sentiment_status == 'Alcista':
+        long_score += 1
+    elif sentiment_status == 'Bajista':
+        long_score -= 1
+    long_details['sentiment'] = sentiment_status
+    
+    if fvg_arriba:
+        long_score += 2
+        long_details['fvg_magnet'] = True
+        long_details['fvg_target'] = fvg_arriba[0]['center_price']
+    
+    # Minimum 5 pts to report (support + anything else, or divergence + FVG)
+    if long_score >= 5:
+        target = fvg_arriba[0]['center_price'] if fvg_arriba else price * 1.03
         confluences.append({
             "symbol": symbol,
             "setup_type": "LONG",
             "target_price": target,
-            "score": score,
-            "details": {
-                "support_level": soportes_cercanos[0]['price_level'],
-                "support_tf": soportes_cercanos[0]['confluence'],
-                "rsi_price": rsi_alcista[0]['price'],
-                "rsi_tf": [r['timeframe'] for r in rsi_alcista],
-                "sentiment": sentiment_status,
-                "fvg_magnet": True if fvg_arriba else False
-            }
+            "score": min(10, long_score),
+            "details": long_details
         })
-        
-    # --- LÓGICA DE CONFLUENCIA SHORT (VENTA) ---
-    if resistencias_cercanas and rsi_bajista and sentiment_status != "Alcista":
-        score = 8
-        target = fvg_abajo[0]['center_price'] if fvg_abajo else price * 0.95
-        if fvg_abajo: score = 10 
-        
+    
+    # --- LÓGICA DE CONFLUENCIA SHORT ---
+    short_score = 0
+    short_details = {}
+    
+    if resistencias_cercanas:
+        best_res = max(resistencias_cercanas, key=lambda r: r.get('touches', 1))
+        short_score += 3 + min(2, len(best_res.get('confluence', [])))
+        short_details['resistance_level'] = best_res['price_level']
+        short_details['resistance_tf'] = best_res.get('confluence', [])
+        short_details['resistance_touches'] = best_res.get('touches', 1)
+    
+    if rsi_bajista:
+        short_score += 3
+        short_details['rsi_price'] = rsi_bajista[0].get('price')
+        short_details['rsi_tf'] = [r['timeframe'] for r in rsi_bajista]
+    
+    if sentiment_status == 'Bajista':
+        short_score += 1
+    elif sentiment_status == 'Alcista':
+        short_score -= 1
+    short_details['sentiment'] = sentiment_status
+    
+    if fvg_abajo:
+        short_score += 2
+        short_details['fvg_magnet'] = True
+        short_details['fvg_target'] = fvg_abajo[0]['center_price']
+    
+    if short_score >= 5:
+        target = fvg_abajo[0]['center_price'] if fvg_abajo else price * 0.97
         confluences.append({
             "symbol": symbol,
             "setup_type": "SHORT",
             "target_price": target,
-            "score": score,
-            "details": {
-                "resistance_level": resistencias_cercanas[0]['price_level'],
-                "resistance_tf": resistencias_cercanas[0]['confluence'],
-                "rsi_price": rsi_bajista[0]['price'],
-                "rsi_tf": [r['timeframe'] for r in rsi_bajista],
-                "sentiment": sentiment_status,
-                "fvg_magnet": True if fvg_abajo else False
-            }
+            "score": min(10, short_score),
+            "details": short_details
         })
         
     return confluences
