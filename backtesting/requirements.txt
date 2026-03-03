@@ -1,0 +1,6 @@
+pandas
+ccxt
+numpy
+scipy
+fastapi
+uvicorn[standard]
