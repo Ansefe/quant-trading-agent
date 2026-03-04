@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-api.py — FastAPI server for the backtesting engine.
+api.py — FastAPI server for the V2 backtesting engine.
 
 Endpoints:
   POST /run-backtest  — Execute a backtest with given parameters
-  GET  /datasets      — List available downloaded datasets
+  GET  /datasets      — List available multi-TF dataset directories
 """
 
 import os
-import glob
+import json
 import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from typing import List, Optional
 
 from engine import run_backtest
 
-# Suppress noisy uvicorn access logs (GET /datasets polling)
+# Suppress noisy uvicorn access logs
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
-app = FastAPI(title="Quant Backtester API", version="1.0")
+app = FastAPI(title="Quant Backtester API V2", version="2.0")
 
-# Allow frontend requests
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,85 +33,104 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 
 
 class BacktestRequest(BaseModel):
-    symbol: str = Field(default="BTC/USDT", description="Trading pair")
-    timeframe: str = Field(default="1h", description="Timeframe")
+    dataset_dir: str = Field(description="Dataset directory name (e.g. BTCUSDT_30d)")
     take_profit_pct: float = Field(default=2.0, description="Take profit %")
     stop_loss_pct: float = Field(default=1.0, description="Stop loss %")
     leverage: int = Field(default=5, description="Leverage multiplier")
-    scan_interval: int = Field(default=10, description="Run scanners every N candles")
-    dataset_file: str = Field(default="", description="Exact CSV filename to use")
+    scan_interval: int = Field(default=10, description="Scanners every N candles")
+    min_touches: int = Field(default=3, description="Minimum S/R touches")
+    proximity_pct: float = Field(default=1.0, description="Max distance % to consider S/R level")
+    require_divergence: str = Field(default="off", description="'off' or 'on'")
+    divergence_max_tf: str = Field(default="any", description="Max TF for divergence: 15m, 1h, 4h, 1d, any")
+    mode: str = Field(default="clean", description="'clean' or 'martingale'")
+    # Martingale params
+    total_capital: float = Field(default=500.0, description="Total capital USD")
+    entries_count: int = Field(default=4, description="Number of DCA entries")
+    entry_distance_pct: float = Field(default=1.5, description="Distance % between entries")
+    entry_allocations: Optional[List[float]] = Field(default=None, description="Allocation % per entry")
 
 
 @app.get("/datasets")
 def list_datasets():
-    """List available CSV datasets."""
+    """List available multi-TF dataset directories."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    files = glob.glob(os.path.join(DATA_DIR, '*.csv'))
     datasets = []
-    for f in files:
-        basename = os.path.basename(f)
-        parts = basename.replace('.csv', '').split('_')
-        if len(parts) >= 2:
-            # e.g. BTCUSDT_1h.csv → symbol=BTCUSDT, tf=1h
-            symbol_raw = parts[0]
-            tf = parts[1]
-            # Reconstruct pair format
-            for base in ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'ADA', 'DOGE', 'AVAX']:
-                if symbol_raw.startswith(base):
-                    symbol = f"{base}/{symbol_raw[len(base):]}"
-                    break
-            else:
-                symbol = symbol_raw
 
-            import pandas as pd
+    for name in sorted(os.listdir(DATA_DIR)):
+        dir_path = os.path.join(DATA_DIR, name)
+        if not os.path.isdir(dir_path):
+            continue
+
+        meta_path = os.path.join(dir_path, 'meta.json')
+        if os.path.exists(meta_path):
             try:
-                df = pd.read_csv(f)
-                candles = len(df)
-                start = pd.to_datetime(df['timestamp'].iloc[0], unit='ms').strftime('%Y-%m-%d')
-                end = pd.to_datetime(df['timestamp'].iloc[-1], unit='ms').strftime('%Y-%m-%d')
-            except Exception:
-                candles = 0
-                start = end = '?'
+                with open(meta_path) as f:
+                    meta = json.load(f)
 
-            datasets.append({
-                'symbol': symbol,
-                'timeframe': tf,
-                'candles': candles,
-                'date_range': f"{start} → {end}",
-                'file': basename
-            })
+                # Count total candles and get date range from clock TF
+                tfs = meta.get('timeframes', {})
+                tf_list = list(tfs.keys())
+                total_candles = sum(t.get('candles', 0) for t in tfs.values())
+
+                # Get simulation range from lowest TF
+                clock_tf = '15m' if '15m' in tfs else (tf_list[0] if tf_list else '?')
+                clock_info = tfs.get(clock_tf, {})
+
+                datasets.append({
+                    'name': name,
+                    'symbol': meta.get('symbol', '?'),
+                    'days': meta.get('days', '?'),
+                    'timeframes': tf_list,
+                    'total_candles': total_candles,
+                    'clock_tf': clock_tf,
+                    'date_range': f"{clock_info.get('start', '?')} → {clock_info.get('end', '?')}",
+                    'downloaded_at': meta.get('downloaded_at', '?')
+                })
+            except Exception:
+                datasets.append({
+                    'name': name, 'symbol': '?', 'days': '?',
+                    'timeframes': [], 'total_candles': 0,
+                    'clock_tf': '?', 'date_range': '?',
+                    'downloaded_at': '?'
+                })
+
     return datasets
 
 
 @app.post("/run-backtest")
 def run(req: BacktestRequest):
-    """Execute a backtest."""
-    # If exact file specified, use it directly
-    if req.dataset_file:
-        csv_path = os.path.join(DATA_DIR, req.dataset_file)
-        if not os.path.exists(csv_path):
-            return {'error': f'File not found: {req.dataset_file}'}
-    else:
-        # Fallback: glob match
-        safe_symbol = req.symbol.replace('/', '')
-        pattern = os.path.join(DATA_DIR, f"{safe_symbol}_{req.timeframe}*.csv")
-        matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
-        if not matches:
-            return {
-                'error': f'No dataset found for {req.symbol} {req.timeframe}. '
-                         f'Run: python download_history.py --symbol {req.symbol} --timeframe {req.timeframe}'
-            }
-        csv_path = matches[0]
+    """Execute a V2 backtest."""
+    dataset_path = os.path.join(DATA_DIR, req.dataset_dir)
 
-    print(f"\n🧪 Using dataset: {os.path.basename(csv_path)}")
+    if not os.path.isdir(dataset_path):
+        return {'error': f'Dataset directory not found: {req.dataset_dir}. Run download_history.py first.'}
+
+    # Parse allocations
+    allocations = None
+    if req.entry_allocations:
+        # Convert percentages to fractions if needed
+        allocs = req.entry_allocations
+        if any(a > 1 for a in allocs):
+            allocs = [a / 100 for a in allocs]
+        allocations = allocs
+
+    print(f"\n🧪 Starting backtest: {req.dataset_dir} — {req.mode.upper()} mode")
 
     result = run_backtest(
-        csv_path=csv_path,
-        timeframe=req.timeframe,
+        dataset_dir=dataset_path,
         tp_pct=req.take_profit_pct,
         sl_pct=req.stop_loss_pct,
         leverage=req.leverage,
-        scan_interval=req.scan_interval
+        scan_interval=req.scan_interval,
+        min_touches=req.min_touches,
+        mode=req.mode,
+        proximity_pct=req.proximity_pct,
+        require_divergence=req.require_divergence,
+        divergence_max_tf=req.divergence_max_tf,
+        total_capital=req.total_capital,
+        entries_count=req.entries_count,
+        entry_distance_pct=req.entry_distance_pct,
+        entry_allocations=allocations
     )
 
     return result
