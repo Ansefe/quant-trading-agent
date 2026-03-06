@@ -91,8 +91,14 @@ def load_multi_tf_data(dataset_dir):
 
 
 def get_tf_slice(df, current_time):
-    """Get the slice of a TF DataFrame up to current_time (no look-ahead)."""
-    return df[df['timestamp'] <= current_time].copy()
+    """Get the slice of a TF DataFrame up to current_time (no look-ahead).
+    Uses searchsorted for O(log n) performance instead of full boolean mask."""
+    # Use pre-sorted timestamp index for fast binary search
+    ts_col = df['timestamp'].values
+    idx = np.searchsorted(ts_col, current_time, side='right')
+    if idx == 0:
+        return df.iloc[0:0]  # Empty slice
+    return df.iloc[:idx]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -144,6 +150,7 @@ def scan_sr_multi_tf(datasets, current_time):
         result.append({
             'price_level': lvl['precio_linea'],
             'touches': lvl['toques'],
+            'touches_by_tf': lvl.get('touches_by_tf', {}),
             'confluence': lvl['confluencia'],  # List of TFs like ['1h', '4h', '1d']
             'is_support': is_support
         })
@@ -234,54 +241,100 @@ def scan_fvg_multi_tf(datasets, current_time):
 # Confluence Scoring V2 (Multi-TF aware)
 # ──────────────────────────────────────────────────────────────
 
-def score_confluence(price, sr_levels, fvgs, divergences, min_touches=3,
+def score_confluence(price, sr_levels, fvgs, divergences,
+                     global_min_touches=3, mandatory_tfs=None, min_touches_by_tf=None,
                      proximity_pct=3.0, require_divergence='off', divergence_max_tf='any'):
     """
-    Score-based confluence detector with multi-TF awareness.
+    Score-based confluence detector with weighted multi-TF awareness.
     Returns signals with limit_price at the SR level (not market price).
 
-    Args:
-        proximity_pct: Max distance % from price to consider an SR level
-        require_divergence: 'off' = no requirement, 'on' = require RSI divergence
-        divergence_max_tf: 'any', '15m', '1h', '4h', '1d' — max TF to consider for divergence filter
+    Hard Filtering:
+        1. Level must have touches >= global_min_touches
+        2. All mandatory_tfs must be present in level's confluence list
+        3. Per-TF touch counts must meet min_touches_by_tf requirements
+
+    Weighted Scoring:
+        TF weights: 15m=1, 1h=2, 4h=3, 1d=4, 1w=5
+        Sum weights of present TFs:
+          >= 7 → +5 pts, >= 4 → +4 pts, else → +3 pts
     """
+    if mandatory_tfs is None:
+        mandatory_tfs = ['1h']
+    if min_touches_by_tf is None:
+        min_touches_by_tf = {'4h': 1, '1h': 2}
+
     proximity = proximity_pct / 100
     signals = []
 
+    # TF weight map for scoring
+    TF_WEIGHTS = {'15m': 1, '1h': 2, '4h': 3, '1d': 4, '1w': 5}
+
     # TF rank filter for divergence requirement
-    TF_MAX_RANK = {'15m': 0, '1h': 1, '4h': 2, '1d': 3, 'any': 99}
-    div_max_rank = TF_MAX_RANK.get(divergence_max_tf, 99)
+    TF_DIV_RANK = {'15m': 0, '1h': 1, '4h': 2, '1d': 3, 'any': 99}
+    div_max_rank = TF_DIV_RANK.get(divergence_max_tf, 99)
 
-    # Filter by min_touches
-    quality_levels = [l for l in sr_levels if l.get('touches', 0) >= min_touches]
+    # ── Paso A: Hard Filtering ──
+    quality_levels = []
+    for lvl in sr_levels:
+        # 1. Global min touches
+        total_touches = lvl.get('touches', 0)
+        if total_touches < global_min_touches:
+            continue
 
+        # 2. Mandatory TFs must be present in confluence
+        confluence = lvl.get('confluence', [])
+        if not all(tf in confluence for tf in mandatory_tfs):
+            continue
+
+        # 3. Per-TF touch requirements
+        touches_by_tf = lvl.get('touches_by_tf', {})
+        passes_tf_check = True
+        for req_tf, req_count in min_touches_by_tf.items():
+            if touches_by_tf.get(req_tf, 0) < req_count:
+                passes_tf_check = False
+                break
+        if not passes_tf_check:
+            continue
+
+        quality_levels.append(lvl)
+
+    # Separate into supports/resistances within proximity
     supports = [s for s in quality_levels if s['is_support'] and abs(price - s['price_level']) / price < proximity]
     resistances = [r for r in quality_levels if not r['is_support'] and abs(r['price_level'] - price) / price < proximity]
 
+    # RSI divergences (filtered by max TF)
     rsi_bull = [d for d in divergences if 'ALCISTA' in d['type'] and 'ACTIVA' in d['state']
                 and TF_RANK.get(d.get('tf', '15m'), 0) <= div_max_rank]
     rsi_bear = [d for d in divergences if 'BAJISTA' in d['type'] and 'ACTIVA' in d['state']
                 and TF_RANK.get(d.get('tf', '15m'), 0) <= div_max_rank]
 
+    # FVGs
     fvg_above = [f for f in fvgs if f['center_price'] > price]
     fvg_below = [f for f in fvgs if f['center_price'] < price]
 
-    # ── LONG scoring ──
+    # ── Paso B: Weighted LONG scoring ──
     long_score = 0
     long_details = {}
 
     if supports:
-        best = max(supports, key=lambda s: len(s.get('confluence', [])) * 10 + s.get('touches', 0))
-        conf_count = len(best.get('confluence', []))
-        if conf_count >= 3:
+        # Best = highest weighted confluence, then most touches
+        def support_rank(s):
+            weight = sum(TF_WEIGHTS.get(tf, 1) for tf in s.get('confluence', []))
+            return weight * 100 + s.get('touches', 0)
+        best = max(supports, key=support_rank)
+
+        tf_weight = sum(TF_WEIGHTS.get(tf, 1) for tf in best.get('confluence', []))
+        if tf_weight >= 7:
             long_score += 5
-        elif conf_count >= 2:
+        elif tf_weight >= 4:
             long_score += 4
         else:
             long_score += 3
         long_details['support'] = round(best['price_level'], 2)
         long_details['touches'] = best.get('touches', 0)
+        long_details['touches_by_tf'] = best.get('touches_by_tf', {})
         long_details['confluence'] = best.get('confluence', [])
+        long_details['tf_weight'] = tf_weight
 
     if rsi_bull:
         bull_tfs = set(d.get('tf', '?') for d in rsi_bull)
@@ -294,8 +347,8 @@ def score_confluence(price, sr_levels, fvgs, divergences, min_touches=3,
         long_details['fvg_target'] = round(best_fvg['center_price'], 2)
         long_details['fvg_tf'] = best_fvg.get('tf', '?')
 
-    if long_score >= 6:
-        # Divergence gate
+    # GATE: LONG requires a valid support level
+    if long_score >= 5 and supports:
         if require_divergence == 'on' and not rsi_bull:
             pass  # Skip — no divergence
         else:
@@ -307,22 +360,28 @@ def score_confluence(price, sr_levels, fvgs, divergences, min_touches=3,
                 'limit_price': limit_price
             })
 
-    # ── SHORT scoring ──
+    # ── Paso B: Weighted SHORT scoring ──
     short_score = 0
     short_details = {}
 
     if resistances:
-        best = max(resistances, key=lambda r: len(r.get('confluence', [])) * 10 + r.get('touches', 0))
-        conf_count = len(best.get('confluence', []))
-        if conf_count >= 3:
+        def resistance_rank(r):
+            weight = sum(TF_WEIGHTS.get(tf, 1) for tf in r.get('confluence', []))
+            return weight * 100 + r.get('touches', 0)
+        best = max(resistances, key=resistance_rank)
+
+        tf_weight = sum(TF_WEIGHTS.get(tf, 1) for tf in best.get('confluence', []))
+        if tf_weight >= 7:
             short_score += 5
-        elif conf_count >= 2:
+        elif tf_weight >= 4:
             short_score += 4
         else:
             short_score += 3
         short_details['resistance'] = round(best['price_level'], 2)
         short_details['touches'] = best.get('touches', 0)
+        short_details['touches_by_tf'] = best.get('touches_by_tf', {})
         short_details['confluence'] = best.get('confluence', [])
+        short_details['tf_weight'] = tf_weight
 
     if rsi_bear:
         bear_tfs = set(d.get('tf', '?') for d in rsi_bear)
@@ -335,8 +394,8 @@ def score_confluence(price, sr_levels, fvgs, divergences, min_touches=3,
         short_details['fvg_target'] = round(best_fvg['center_price'], 2)
         short_details['fvg_tf'] = best_fvg.get('tf', '?')
 
-    if short_score >= 6:
-        # Divergence gate
+    # GATE: SHORT requires a valid resistance level
+    if short_score >= 5 and resistances:
         if require_divergence == 'on' and not rsi_bear:
             pass  # Skip — no divergence
         else:
@@ -565,7 +624,8 @@ class MartingalePosition:
 # ──────────────────────────────────────────────────────────────
 
 def run_backtest(dataset_dir, tp_pct, sl_pct, leverage,
-                 scan_interval=10, min_touches=3, mode='clean',
+                 scan_interval=10, mode='clean',
+                 global_min_touches=3, mandatory_tfs=None, min_touches_by_tf=None,
                  proximity_pct=3.0, require_divergence='off', divergence_max_tf='any',
                  # Martingale params
                  total_capital=500.0, entries_count=4,
@@ -596,7 +656,8 @@ def run_backtest(dataset_dir, tp_pct, sl_pct, leverage,
 
     # Load data
     print(f"\n🚀 Backtesting V2 — {mode.upper()} mode")
-    print(f"   TP: {tp_pct}% | SL: {sl_pct}% | Leverage: {leverage}x | Min Touches: {min_touches}")
+    print(f"   TP: {tp_pct}% | SL: {sl_pct}% | Leverage: {leverage}x | Global Min Touches: {global_min_touches}")
+    print(f"   Mandatory TFs: {mandatory_tfs} | Min Touches/TF: {min_touches_by_tf}")
     if mode == 'martingale':
         print(f"   Capital: ${total_capital} | Entries: {entries_count} | Distance: {entry_distance_pct}%")
         print(f"   Allocations: {[f'{a*100:.0f}%' for a in entry_allocations]}")
@@ -634,14 +695,26 @@ def run_backtest(dataset_dir, tp_pct, sl_pct, leverage,
     cached_divs = []
 
     sim_candles = total_candles - WARMUP_CANDLES
-    print(f"\n   Reloj: {clock_tf} | Total: {total_candles} | Warmup: {WARMUP_CANDLES} | Simulando: {sim_candles} velas\n")
+    print(f"\n   Reloj: {clock_tf} | Total: {total_candles} | Warmup: {WARMUP_CANDLES} | Simulando: {sim_candles} velas")
+
+    # ── Performance: Pre-extract numpy arrays for clock candles ──
+    clock_open = clock_df['open'].values
+    clock_high = clock_df['high'].values
+    clock_low = clock_df['low'].values
+    clock_close = clock_df['close'].values
+    clock_timestamps = clock_df['timestamp'].values
+    print(f"   ⚡ Arrays numpy pre-extraídos para iteración rápida\n")
 
     for i in range(WARMUP_CANDLES, total_candles):
-        candle = clock_df.iloc[i]
-        price = candle['close']
-        current_time = candle['timestamp']
+        price = float(clock_close[i])
+        high_i = float(clock_high[i])
+        low_i = float(clock_low[i])
+        current_time = clock_timestamps[i]
 
         # 1. Check open positions
+        # Build candle dict once per iteration (needed by Position classes)
+        candle = {'open': float(clock_open[i]), 'high': high_i, 'low': low_i,
+                  'close': price, 'timestamp': current_time}
         still_open = []
         for pos in open_positions:
             was_closed = pos.check(candle)
@@ -658,6 +731,7 @@ def run_backtest(dataset_dir, tp_pct, sl_pct, leverage,
 
         # 2. Run scanners periodically
         if i % scan_interval == 0:
+            # Use scan cache: slice each TF once per cycle
             cached_sr = scan_sr_multi_tf(datasets, current_time)
             cached_fvgs = scan_fvg_multi_tf(datasets, current_time)
             cached_divs = scan_divergences_multi_tf(datasets, current_time)
@@ -679,10 +753,10 @@ def run_backtest(dataset_dir, tp_pct, sl_pct, leverage,
         if pending_order and not open_positions:
             po = pending_order
             filled = False
-            if po['type'] == 'LONG' and candle['low'] <= po['limit_price']:
+            if po['type'] == 'LONG' and low_i <= po['limit_price']:
                 filled = True
                 fill_price = po['limit_price']
-            elif po['type'] == 'SHORT' and candle['high'] >= po['limit_price']:
+            elif po['type'] == 'SHORT' and high_i >= po['limit_price']:
                 filled = True
                 fill_price = po['limit_price']
 
@@ -717,7 +791,9 @@ def run_backtest(dataset_dir, tp_pct, sl_pct, leverage,
         # 4. Generate new pending limit orders (if no position and no pending)
         if not open_positions and not pending_order and (i - last_close_idx) >= COOLDOWN_CANDLES:
             signals = score_confluence(price, cached_sr, cached_fvgs, cached_divs,
-                                       min_touches=min_touches,
+                                       global_min_touches=global_min_touches,
+                                       mandatory_tfs=mandatory_tfs,
+                                       min_touches_by_tf=min_touches_by_tf,
                                        proximity_pct=proximity_pct,
                                        require_divergence=require_divergence,
                                        divergence_max_tf=divergence_max_tf)
@@ -738,9 +814,10 @@ def run_backtest(dataset_dir, tp_pct, sl_pct, leverage,
             print(f"   {pct:.0f}% — Vela {i}/{total_candles} | Trades: {len(trades)} | Balance: ${balance:.2f}", end='\r')
 
     # Close remaining positions
-    last_candle = clock_df.iloc[-1]
+    last_price = float(clock_close[-1])
+    last_time = clock_timestamps[-1]
     for pos in open_positions:
-        pos._close(last_candle['close'], last_candle['timestamp'], 'END')
+        pos._close(last_price, last_time, 'END')
         trades.append(pos.to_dict())
         balance += pos.pnl_usd
 

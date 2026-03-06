@@ -59,10 +59,17 @@ def cluster_levels(levels, threshold_pct):
             min_price = np.min(precios)
             max_price = np.max(precios)
             width_pct = ((max_price - min_price) / min_price) * 100
+
+            # Count touches per TF
+            touches_by_tf = {}
+            for item in c:
+                tf = item[1]
+                touches_by_tf[tf] = touches_by_tf.get(tf, 0) + 1
             
             final_levels.append({
                 'precio_linea': np.mean(precios),
                 'toques': len(c),
+                'touches_by_tf': touches_by_tf,
                 'confluencia': temporalidades,
                 'grosor_pct': width_pct,
                 'tipo_zona': "Línea exacta" if width_pct <= (threshold_pct*100/2) else "Zona ancha"

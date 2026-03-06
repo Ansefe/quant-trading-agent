@@ -10,12 +10,14 @@ Endpoints:
 import os
 import json
 import logging
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Dict, Optional, Set
+import asyncio
 
 from engine import run_backtest
+from live_engine import engine_instance
 
 # Suppress noisy uvicorn access logs
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
@@ -38,7 +40,10 @@ class BacktestRequest(BaseModel):
     stop_loss_pct: float = Field(default=1.0, description="Stop loss %")
     leverage: int = Field(default=5, description="Leverage multiplier")
     scan_interval: int = Field(default=10, description="Scanners every N candles")
-    min_touches: int = Field(default=3, description="Minimum S/R touches")
+    min_touches: int = Field(default=3, description="Minimum S/R touches (legacy, used as global_min_touches if not set)")
+    global_min_touches: int = Field(default=3, description="Minimum total touches across all TFs")
+    mandatory_tfs: List[str] = Field(default=["1h"], description="TFs that MUST be present in confluence")
+    min_touches_by_tf: Dict[str, int] = Field(default={"4h": 1, "1h": 2}, description="Min touches required per specific TF")
     proximity_pct: float = Field(default=1.0, description="Max distance % to consider S/R level")
     require_divergence: str = Field(default="off", description="'off' or 'on'")
     divergence_max_tf: str = Field(default="any", description="Max TF for divergence: 15m, 1h, 4h, 1d, any")
@@ -122,7 +127,9 @@ def run(req: BacktestRequest):
         sl_pct=req.stop_loss_pct,
         leverage=req.leverage,
         scan_interval=req.scan_interval,
-        min_touches=req.min_touches,
+        global_min_touches=req.global_min_touches or req.min_touches,
+        mandatory_tfs=req.mandatory_tfs,
+        min_touches_by_tf=req.min_touches_by_tf,
         mode=req.mode,
         proximity_pct=req.proximity_pct,
         require_divergence=req.require_divergence,
@@ -134,6 +141,112 @@ def run(req: BacktestRequest):
     )
 
     return result
+
+
+# ──────────────────────────────────────────────────────────────
+# Live Paper Trading Endpoints
+# ──────────────────────────────────────────────────────────────
+
+connected_clients: Set[WebSocket] = set()
+
+
+async def broadcast_to_clients(message: str):
+    """Send a message to all connected WebSocket clients."""
+    disconnected = set()
+    for client in connected_clients:
+        try:
+            await client.send_text(message)
+        except Exception:
+            disconnected.add(client)
+    connected_clients.difference_update(disconnected)
+
+
+@app.websocket("/ws/live-feed")
+async def live_feed(websocket: WebSocket):
+    """WebSocket endpoint for live paper trading data stream."""
+    await websocket.accept()
+    connected_clients.add(websocket)
+    print(f"📡 WS client connected ({len(connected_clients)} total)")
+
+    try:
+        while True:
+            # Receive commands from client
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+                action = msg.get('action')
+
+                if action == 'start':
+                    config = msg.get('config', {})
+                    result = await engine_instance.start(config, broadcast_to_clients)
+                    await websocket.send_text(json.dumps({'type': 'start_result', 'data': result}))
+
+                elif action == 'stop':
+                    result = await engine_instance.stop()
+                    await websocket.send_text(json.dumps({'type': 'stop_result', 'data': result}))
+
+                elif action == 'status':
+                    status = engine_instance.get_status()
+                    await websocket.send_text(json.dumps({'type': 'status', 'data': status}, default=str))
+
+                elif action == 'get_candles':
+                    tf = msg.get('tf', '15m')
+                    limit = msg.get('limit', 500)
+                    candles = engine_instance.get_candles(tf, limit)
+                    indicators = engine_instance.get_indicators(tf, limit)
+                    await websocket.send_text(json.dumps({
+                        'type': 'candles_data',
+                        'data': {
+                            'tf': tf,
+                            'candles': candles,
+                            'indicators': indicators,
+                            'sr_levels': engine_instance.cached_sr[:30],
+                        }
+                    }, default=str))
+
+                elif action == 'update_config':
+                    new_config = msg.get('config', {})
+                    result = engine_instance.update_config(new_config)
+                    await websocket.send_text(json.dumps({'type': 'config_updated', 'data': result}))
+
+            except json.JSONDecodeError:
+                await websocket.send_text(json.dumps({'type': 'error', 'data': {'message': 'Invalid JSON'}}))
+
+    except WebSocketDisconnect:
+        connected_clients.discard(websocket)
+        print(f"📡 WS client disconnected ({len(connected_clients)} remaining)")
+    except Exception as e:
+        connected_clients.discard(websocket)
+        print(f"📡 WS error: {e}")
+
+
+@app.post("/live/start")
+async def live_start(config: dict = {}):
+    """Start the live paper trading engine."""
+    result = await engine_instance.start(config, broadcast_to_clients)
+    return result
+
+
+@app.post("/live/stop")
+async def live_stop():
+    """Stop the live paper trading engine."""
+    result = await engine_instance.stop()
+    return result
+
+
+@app.get("/live/status")
+def live_status():
+    """Get current live engine status."""
+    return engine_instance.get_status()
+
+
+@app.get("/live/candles")
+def live_candles(tf: str = '15m', limit: int = 500):
+    """Get candle data + indicators for a specific timeframe."""
+    return {
+        'candles': engine_instance.get_candles(tf, limit),
+        'indicators': engine_instance.get_indicators(tf, limit)
+    }
 
 
 if __name__ == '__main__':
