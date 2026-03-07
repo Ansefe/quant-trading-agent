@@ -1,0 +1,746 @@
+import argparse
+import time
+import datetime
+import ccxt
+from utils.db import (
+    insert_sentiment,
+    insert_sr_levels,
+    insert_rsi_divergences,
+    insert_fvgs,
+    insert_trade_confluences
+)
+
+# Importamos los módulos de los scripts
+from fetch_data import fetch_market_data, send_telegram
+from sr_scanner import scan_symbol as scan_sr
+from rsi_divergence import scan_market as scan_rsi
+from smc_scanner import scan_smc as scan_smc_levels
+
+def get_current_price(symbol):
+    try:
+        exchange = ccxt.binance()
+        ticker = exchange.fetch_ticker(symbol)
+        return ticker['last']
+    except Exception as e:
+        print(f"Error obteniendo precio de {symbol}: {e}")
+        return None
+
+def analyze_confluences(symbol, price, sentiment_list, sr_list, rsi_list, smc_list):
+    confluences = []
+    
+    # Extraemos el sentimiento del activo si existe
+    sentiment_data = next((s for s in sentiment_list if s['symbol'] == symbol), {})
+    sentiment_status = sentiment_data.get('sentiment', 'Neutral')
+    
+    # Proximity filter: 3% from current price (was 2% — too strict)
+    proximity = 0.03
+    
+    soportes_cercanos = [s for s in sr_list if s['is_support'] and abs(price - s['price_level'])/price < proximity]
+    resistencias_cercanas = [r for r in sr_list if not r['is_support'] and abs(r['price_level'] - price)/price < proximity]
+    
+    rsi_alcista = [r for r in rsi_list if 'ALCISTA' in r['type'] and 'ACTIVA' in r['state']]
+    rsi_bajista = [r for r in rsi_list if 'BAJISTA' in r['type'] and 'ACTIVA' in r['state']]
+    
+    fvg_arriba = [f for f in smc_list if f['center_price'] > price]
+    fvg_abajo = [f for f in smc_list if f['center_price'] < price]
+    
+    # --- LÓGICA DE CONFLUENCIA LONG (Score-based, no requirement for ALL conditions) ---
+    long_score = 0
+    long_details = {}
+    
+    if soportes_cercanos:
+        best_support = max(soportes_cercanos, key=lambda s: s.get('touches', 1))
+        long_score += 3 + min(2, len(best_support.get('confluence', [])))  # 3-5 pts for support
+        long_details['support_level'] = best_support['price_level']
+        long_details['support_tf'] = best_support.get('confluence', [])
+        long_details['support_touches'] = best_support.get('touches', 1)
+    
+    if rsi_alcista:
+        long_score += 3  # 3 pts for divergence
+        long_details['rsi_price'] = rsi_alcista[0].get('price')
+        long_details['rsi_tf'] = [r['timeframe'] for r in rsi_alcista]
+    
+    if sentiment_status == 'Alcista':
+        long_score += 1
+    elif sentiment_status == 'Bajista':
+        long_score -= 1
+    long_details['sentiment'] = sentiment_status
+    
+    if fvg_arriba:
+        long_score += 2
+        long_details['fvg_magnet'] = True
+        long_details['fvg_target'] = fvg_arriba[0]['center_price']
+    
+    # Minimum 5 pts to report (support + anything else, or divergence + FVG)
+    if long_score >= 5:
+        target = fvg_arriba[0]['center_price'] if fvg_arriba else price * 1.03
+        confluences.append({
+            "symbol": symbol,
+            "setup_type": "LONG",
+            "target_price": target,
+            "score": min(10, long_score),
+            "details": long_details
+        })
+    
+    # --- LÓGICA DE CONFLUENCIA SHORT ---
+    short_score = 0
+    short_details = {}
+    
+    if resistencias_cercanas:
+        best_res = max(resistencias_cercanas, key=lambda r: r.get('touches', 1))
+        short_score += 3 + min(2, len(best_res.get('confluence', [])))
+        short_details['resistance_level'] = best_res['price_level']
+        short_details['resistance_tf'] = best_res.get('confluence', [])
+        short_details['resistance_touches'] = best_res.get('touches', 1)
+    
+    if rsi_bajista:
+        short_score += 3
+        short_details['rsi_price'] = rsi_bajista[0].get('price')
+        short_details['rsi_tf'] = [r['timeframe'] for r in rsi_bajista]
+    
+    if sentiment_status == 'Bajista':
+        short_score += 1
+    elif sentiment_status == 'Alcista':
+        short_score -= 1
+    short_details['sentiment'] = sentiment_status
+    
+    if fvg_abajo:
+        short_score += 2
+        short_details['fvg_magnet'] = True
+        short_details['fvg_target'] = fvg_abajo[0]['center_price']
+    
+    if short_score >= 5:
+        target = fvg_abajo[0]['center_price'] if fvg_abajo else price * 0.97
+        confluences.append({
+            "symbol": symbol,
+            "setup_type": "SHORT",
+            "target_price": target,
+            "score": min(10, short_score),
+            "details": short_details
+        })
+        
+    return confluences
+
+def main():
+    parser = argparse.ArgumentParser(description="Orquestador Maestro Quant")
+    parser.add_argument("--symbols", nargs="+", default=["BTC/USDT", "ETH/USDT"], help="Símbolos a escanear")
+    args = parser.parse_args()
+    
+    print("🚀 Iniciando Orquestador Maestro Quant...")
+    
+    # 1. Extraer Sentimiento Global (1 solo request)
+    print("\n[Paso 1] Extrayendo Sentimiento Macro y de Noticias...")
+    sentiment_data = fetch_market_data(send_alert=False)
+    if sentiment_data:
+        insert_sentiment(sentiment_data)
+        
+    all_confluences = []
+    
+    # 2. Iterar por cada activo pasando por los otros 3 Motores
+    for symbol in args.symbols:
+        print(f"\n==========================================")
+        print(f"🔄 PROCESANDO ACTIVO: {symbol}")
+        print(f"==========================================")
+        
+        current_price = get_current_price(symbol)
+        if not current_price: continue
+            
+        print("\n[Paso 2] Escaneando Muros Cuantitativos ATR (por temporalidad)...")
+        
+        # ── Escaneo por temporalidad ──────────────────────────────────────────
+        # Cada TF corre de forma independiente: sus top-10 S/R se guardan
+        # con confluence=['15m'] (o lo que corresponda), así el frontend
+        # puede filtrar "solo 1W" o "solo 4h" sin contaminación de otras TFs.
+        # Después hacemos un escaneo multi-TF para detectar confluencias reales.
+        
+        TF_CONFIGS = {
+            '15m': {'limit': 1000, 'top_n': 10},
+            '1h':  {'limit': 1000, 'top_n': 10},
+            '4h':  {'limit': 1000, 'top_n': 10},
+            '1d':  {'limit': 1000, 'top_n': 10},
+            '1w':  {'limit': 1000, 'top_n': 10},  # Binance devuelve lo disponible si hay menos
+        }
+        
+        all_sr_data = []
+        for tf, cfg in TF_CONFIGS.items():
+            try:
+                tf_data = scan_sr(symbol, [tf], cfg['limit'], cfg['top_n'])
+                if tf_data:
+                    # Etiquetamos como escaneo aislado por TF
+                    for row in tf_data:
+                        row['source_run'] = 'per_tf'
+                    all_sr_data.extend(tf_data)
+                    print(f"   ✅ {tf}: {len(tf_data)} muros")
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"   ⚠️ Error en SR/{tf}: {e}")
+        
+        # Escaneo multi-TF para detectar confluencias inter-temporalidad
+        try:
+            multi_tf_data = scan_sr(symbol, list(TF_CONFIGS.keys()), 1000, 5)
+            if multi_tf_data:
+                for row in multi_tf_data:
+                    row['source_run'] = 'multi_tf'
+                all_sr_data.extend(multi_tf_data)
+                print(f"   🏆 Multi-TF: {len(multi_tf_data)} confluencias")
+        except Exception as e:
+            print(f"   ⚠️ Error en SR/multi-TF: {e}")
+        
+        if all_sr_data:
+            insert_sr_levels(all_sr_data)
+        
+        time.sleep(1) # Rate limit protection
+
+        
+        print("\n[Paso 3] Escaneando Divergencias RSI...")
+        rsi_data = scan_rsi([symbol], ['15m', '1h', '4h', '1d', '1w'], historical=False)
+        if rsi_data: insert_rsi_divergences(rsi_data)
+        
+        time.sleep(1) # Rate limit protection
+        
+        print("\n[Paso 4] Escaneando Fair Value Gaps (SMC)...")
+        smc_data = scan_smc_levels([symbol], ['15m', '1h', '4h', '1d', '1w'], limit=500)
+        if smc_data: insert_fvgs(smc_data)
+        
+        print("\n[Paso 5] Buscando Confluencias de Alta Probabilidad...")
+        confs = analyze_confluences(symbol, current_price, sentiment_data, all_sr_data or [], rsi_data or [], smc_data or [])
+        
+        if confs:
+            all_confluences.extend(confs)
+            for c in confs:
+                print(f"🔥 ¡CONFLUENCIA {c['setup_type']} DETECTADA EN {c['symbol']}! Score: {c['score']}/10")
+        else:
+            print(f"💤 Ninguna confluencia fuerte en {symbol} en este momento.")
+            
+        time.sleep(2) # Rate limit prevention between symbols
+        
+    # ── Reporte final siempre se envía por Telegram ─────────────────────────
+    # Así siempre sabes que el bot corrió aunque no haya confluencias.
+    hora = datetime.datetime.now().strftime('%H:%M')
+    
+    if all_confluences:
+        insert_trade_confluences(all_confluences)
+        mensaje = f"\ud83d\udc51 *ALERTA DEL ORQUESTADOR QUANT* ({hora}) \ud83d\udc51\n\n"
+        for c in all_confluences:
+            emoji = "\ud83d\ude80" if c['setup_type'] == 'LONG' else "\ud83e\ude78"
+            mensaje += f"{emoji} *{c['symbol']}* | {c['setup_type']} | Score {c['score']}/10\n"
+            if c.get('target_price'):
+                mensaje += f"   Target: ${c['target_price']:,.2f}\n"
+            support_or_res = c['details'].get('support_level') or c['details'].get('resistance_level')
+            if support_or_res:
+                mensaje += f"   Zona: ${support_or_res:,.2f}\n"
+            mensaje += f"   Sentimiento: {c['details'].get('sentiment', '-')}\n"
+            tfs = c['details'].get('support_tf') or c['details'].get('resistance_tf') or []
+            if tfs:
+                mensaje += f"   TFs: {', '.join(tfs)}\n"
+            mensaje += "\n"
+    else:
+        # Resumen de estado sin confluencias
+        symbols_str = ', '.join(args.symbols)
+        mensaje = (
+            f"\ud83d\udcca *Reporte Quant* ({hora})\n"
+            f"Activos: {symbols_str}\n"
+            f"Estado: Sin confluencias fuertes en este momento.\n"
+            f"Datos actualizados en Supabase \u2705"
+        )
+    
+    send_telegram(mensaje)
+
+if __name__ == "__main__":
+    main()
+
+import ccxt
+import pandas as pd
+import numpy as np
+from scipy.signal import argrelextrema
+import argparse
+
+def fetch_ohlcv(symbol, timeframe, limit=1000):
+    exchange = ccxt.binance({'enableRateLimit': True})
+    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    
+    # Conversión de UTC a Hora Local (Colombia UTC-5)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('America/Bogota')
+    return df
+
+def calculate_atr_pct(df, period=14):
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    
+    true_range = ranges.max(axis=1)
+    atr = true_range.rolling(period).mean()
+    atr_pct = atr.iloc[-1] / df['close'].iloc[-1]
+    return atr_pct
+
+def get_fractal_extremes(df, tf, order=10):
+    local_max = argrelextrema(df['high'].values, np.greater_equal, order=order)[0]
+    local_min = argrelextrema(df['low'].values, np.less_equal, order=order)[0]
+
+    resistances = [(df['high'].iloc[i], tf) for i in local_max]
+    supports = [(df['low'].iloc[i], tf) for i in local_min]
+    return supports, resistances
+
+def cluster_levels(levels, threshold_pct):
+    if not levels: return []
+    
+    levels = sorted(levels, key=lambda x: x[0])
+    clusters = []
+    current_cluster = [levels[0]]
+
+    for level in levels[1:]:
+        precio_actual = level[0]
+        mean_c = np.mean([item[0] for item in current_cluster])
+        
+        if abs(precio_actual - mean_c) / mean_c <= threshold_pct:
+            current_cluster.append(level)
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [level]
+    clusters.append(current_cluster)
+
+    final_levels = []
+    for c in clusters:
+        if len(c) >= 2:
+            precios = [item[0] for item in c]
+            temporalidades = list(set([item[1] for item in c]))
+            min_price = np.min(precios)
+            max_price = np.max(precios)
+            width_pct = ((max_price - min_price) / min_price) * 100
+
+            # Count touches per TF
+            touches_by_tf = {}
+            for item in c:
+                tf = item[1]
+                touches_by_tf[tf] = touches_by_tf.get(tf, 0) + 1
+            
+            final_levels.append({
+                'precio_linea': np.mean(precios),
+                'toques': len(c),
+                'touches_by_tf': touches_by_tf,
+                'confluencia': temporalidades,
+                'grosor_pct': width_pct,
+                'tipo_zona': "Línea exacta" if width_pct <= (threshold_pct*100/2) else "Zona ancha"
+            })
+            
+    return final_levels
+
+def format_price(price):
+    """Ajusta los decimales automáticamente según el valor de la moneda"""
+    if price < 0.001:
+        return f"{price:.8f}"
+    elif price < 1:
+        return f"{price:.4f}"
+    else:
+        return f"{price:,.2f}"
+
+def scan_symbol(symbol, timeframes, limit, max_results):
+    print(f"\n--- 🎯 Muros Cuantitativos Dinámicos (ATR) para {symbol} ---")
+    
+    try:
+        daily_df = fetch_ohlcv(symbol, '1d', limit=60)
+        volatilidad_diaria_pct = calculate_atr_pct(daily_df, period=14)
+        dynamic_threshold = volatilidad_diaria_pct * 0.25 
+        print(f"Volatilidad Diaria (ATR): {volatilidad_diaria_pct*100:.2f}% | Umbral de Agrupación: {dynamic_threshold*100:.2f}%")
+    except Exception as e:
+        print(f"Error calculando ATR: {e}. Usando default 0.8%")
+        dynamic_threshold = 0.008
+
+    print(f"Analizando confluencia en: {', '.join(timeframes)} | Velas por TF: {limit}")
+    
+    all_supports = []
+    all_resistances = []
+    
+    for tf in timeframes:
+        try:
+            df = fetch_ohlcv(symbol, tf, limit=limit)
+            if tf in ['15m', '1h']: order = 20
+            elif tf == '4h': order = 10
+            elif tf == '1d': order = 5
+            elif tf == '1w': order = 3
+            else: order = 5
+                
+            sup, res = get_fractal_extremes(df, tf, order=order)
+            all_supports.extend(sup)
+            all_resistances.extend(res)
+        except Exception as e:
+            print(f"Error extrayendo {tf}: {e}")
+
+    key_levels = cluster_levels(all_supports + all_resistances, threshold_pct=dynamic_threshold)
+    current_price = fetch_ohlcv(symbol, timeframes[0], limit=1)['close'].iloc[0]
+    print(f"Precio Actual: ${format_price(current_price)}\n")
+    
+    print(f"🧱 TOP {max_results} RESISTENCIAS MÁS CERCANAS (Hacia arriba):")
+    res_count = 0
+    db_data = []
+    
+    for lvl in sorted(key_levels, key=lambda x: x['precio_linea']):
+        if lvl['precio_linea'] > current_price and res_count < max_results:
+            distancia = ((lvl['precio_linea'] - current_price) / current_price) * 100
+            tfs_str = ", ".join(lvl['confluencia'])
+            print(f" 🔴 ${format_price(lvl['precio_linea'])} | A +{distancia:.1f}% | Toques: {lvl['toques']} | Confluencia: [{tfs_str}]")
+            db_data.append({
+                "symbol": symbol,
+                "price_level": float(lvl['precio_linea']),
+                "touches": int(lvl['toques']),
+                "confluence": lvl['confluencia'],
+                "thickness_pct": float(lvl['grosor_pct']),
+                "zone_type": lvl['tipo_zona'],
+                "is_support": False
+            })
+            res_count += 1
+
+    print(f"\n🛌 TOP {max_results} SOPORTES MÁS CERCANOS (Hacia abajo):")
+    sup_count = 0
+    for lvl in sorted(key_levels, key=lambda x: x['precio_linea'], reverse=True):
+        if lvl['precio_linea'] < current_price and sup_count < max_results:
+            distancia = ((current_price - lvl['precio_linea']) / current_price) * 100
+            tfs_str = ", ".join(lvl['confluencia'])
+            print(f" 🟢 ${format_price(lvl['precio_linea'])} | A -{distancia:.1f}% | Toques: {lvl['toques']} | Confluencia: [{tfs_str}]")
+            db_data.append({
+                "symbol": symbol,
+                "price_level": float(lvl['precio_linea']),
+                "touches": int(lvl['toques']),
+                "confluence": lvl['confluencia'],
+                "thickness_pct": float(lvl['grosor_pct']),
+                "zone_type": lvl['tipo_zona'],
+                "is_support": True
+            })
+            sup_count += 1
+            
+    return db_data
+
+if __name__ == "__main__":
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from utils.db import insert_sr_levels
+
+    parser = argparse.ArgumentParser(description="Escáner Quant de Soportes y Resistencias")
+    parser.add_argument("--symbols", nargs="+", required=True, help="Lista de símbolos, ej: BTC/USDT ETH/USDT")
+    parser.add_argument("--tfs", nargs="+", default=['15m', '1h', '4h', '1d', '1w'], help="Temporalidades a escanear")
+    parser.add_argument("--limit", type=int, default=1000, help="Velas históricas a analizar")
+    parser.add_argument("--max", type=int, default=5, help="Número máximo de muros a mostrar por lado")
+    
+    args = parser.parse_args()
+    
+    all_db_data = []
+    for symbol in args.symbols:
+        data = scan_symbol(symbol, args.tfs, args.limit, args.max)
+        if data: all_db_data.extend(data)
+        
+    if all_db_data:
+        insert_sr_levels(all_db_data)
+
+import ccxt
+import pandas as pd
+import argparse
+
+def fetch_ohlcv(symbol, timeframe, limit=500):
+    exchange = ccxt.binance({'enableRateLimit': True})
+    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    
+    # Conversión de UTC a Hora Local (Colombia UTC-5)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('America/Bogota')
+    
+    return df
+
+def find_unmitigated_fvgs(df):
+    fvgs = []
+    
+    # 1. Escanear todo el historial buscando los huecos de 3 velas
+    for i in range(2, len(df)):
+        vela1_high = df['high'].iloc[i-2]
+        vela1_low = df['low'].iloc[i-2]
+        vela2_time = df['timestamp'].iloc[i-1]
+        vela3_high = df['high'].iloc[i]
+        vela3_low = df['low'].iloc[i]
+        
+        # Condición FVG Alcista (Toro): El bajo de la vela 3 no alcanza a tocar el alto de la vela 1
+        if vela3_low > vela1_high:
+            fvgs.append({
+                'tipo': '🟢 FVG ALCISTA',
+                'techo': vela3_low,
+                'piso': vela1_high,
+                'fecha': vela2_time,
+                'idx_formacion': i,
+                'mitigado': False
+            })
+            
+        # Condición FVG Bajista (Oso): El alto de la vela 3 no alcanza a tocar el bajo de la vela 1
+        elif vela3_high < vela1_low:
+            fvgs.append({
+                'tipo': '🔴 FVG BAJISTA',
+                'techo': vela1_low,
+                'piso': vela3_high,
+                'fecha': vela2_time,
+                'idx_formacion': i,
+                'mitigado': False
+            })
+
+    # 2. Comprobar si el mercado ya rellenó (mitigó) el hueco con velas posteriores
+    unmitigated_fvgs = []
+    for fvg in fvgs:
+        mitigado = False
+        # Escaneamos desde la vela donde se formó hasta el precio actual
+        for j in range(fvg['idx_formacion'] + 1, len(df)):
+            if fvg['tipo'] == '🟢 FVG ALCISTA':
+                # Si el precio bajó más allá del piso del gap, está rellenado
+                if df['low'].iloc[j] <= fvg['piso']:
+                    mitigado = True
+                    break
+            elif fvg['tipo'] == '🔴 FVG BAJISTA':
+                # Si el precio subió más allá del techo del gap, está rellenado
+                if df['high'].iloc[j] >= fvg['techo']:
+                    mitigado = True
+                    break
+                    
+        if not mitigado:
+            unmitigated_fvgs.append(fvg)
+            
+    return unmitigated_fvgs
+
+def format_price(price):
+    if price < 0.001: return f"{price:.8f}"
+    elif price < 1: return f"{price:.4f}"
+    else: return f"{price:,.2f}"
+
+def scan_smc(symbols, timeframes, limit):
+    all_db_data = []
+    for symbol in symbols:
+        print(f"\n--- 🐋 Radar SMC (Fair Value Gaps) para {symbol} ---")
+        
+        for tf in timeframes:
+            try:
+                df = fetch_ohlcv(symbol, tf, limit=limit)
+                current_price = df['close'].iloc[-1]
+                active_fvgs = find_unmitigated_fvgs(df)
+                
+                if not active_fvgs:
+                    continue
+                    
+                print(f"\n[{tf}] Precio Actual: ${format_price(current_price)}")
+                
+                # Ordenamos para mostrar los más cercanos al precio actual primero
+                # Calculamos el punto medio del FVG para medir la distancia
+                for fvg in active_fvgs:
+                    fvg['centro'] = (fvg['techo'] + fvg['piso']) / 2
+                    fvg['distancia_pct'] = ((fvg['centro'] - current_price) / current_price) * 100
+
+                active_fvgs.append({"divisor": True}) # Solo para formateo en consola
+                
+                # Filtrar y ordenar los FVGs por encima del precio (Imanes hacia arriba)
+                fvgs_arriba = [f for f in active_fvgs if f.get('centro', 0) > current_price]
+                fvgs_arriba = sorted(fvgs_arriba, key=lambda x: x['distancia_pct'])[:3]
+                
+                # Filtrar y ordenar los FVGs por debajo del precio (Imanes hacia abajo)
+                fvgs_abajo = [f for f in active_fvgs if f.get('centro', float('inf')) < current_price and not f.get('divisor')]
+                fvgs_abajo = sorted(fvgs_abajo, key=lambda x: x['distancia_pct'], reverse=True)[:3]
+
+                for f in fvgs_arriba:
+                    print(f"  {f['tipo']} | Creado: {f['fecha'].strftime('%Y-%m-%d %H:%M')} | Hueco: ${format_price(f['piso'])} - ${format_price(f['techo'])} | A +{f['distancia_pct']:.2f}%")
+                    all_db_data.append({
+                        "symbol": symbol,
+                        "timeframe": tf,
+                        "type": f['tipo'],
+                        "top_price": float(f['techo']),
+                        "bottom_price": float(f['piso']),
+                        "fvg_date": f['fecha'].strftime('%Y-%m-%d %H:%M:%S'),
+                        "mitigated": False,
+                        "center_price": float(f['centro']),
+                        "distance_pct": float(f['distancia_pct'])
+                    })
+                
+                if fvgs_arriba and fvgs_abajo:
+                    print("  ------------------------------------------------")
+
+                for f in fvgs_abajo:
+                    print(f"  {f['tipo']} | Creado: {f['fecha'].strftime('%Y-%m-%d %H:%M')} | Hueco: ${format_price(f['piso'])} - ${format_price(f['techo'])} | A {f['distancia_pct']:.2f}%")
+                    all_db_data.append({
+                        "symbol": symbol,
+                        "timeframe": tf,
+                        "type": f['tipo'],
+                        "top_price": float(f['techo']),
+                        "bottom_price": float(f['piso']),
+                        "fvg_date": f['fecha'].strftime('%Y-%m-%d %H:%M:%S'),
+                        "mitigated": False,
+                        "center_price": float(f['centro']),
+                        "distance_pct": float(f['distancia_pct'])
+                    })
+                    
+            except Exception as e:
+                print(f"Error procesando {tf}: {e}")
+                
+    return all_db_data
+
+if __name__ == "__main__":
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from utils.db import insert_fvgs
+
+    parser = argparse.ArgumentParser(description="Escáner Quant SMC - Fair Value Gaps")
+    parser.add_argument("--symbols", nargs="+", required=True, help="Lista de símbolos, ej: BTC/USDT")
+    parser.add_argument("--tfs", nargs="+", default=['1h', '4h', '1d'], help="Temporalidades a escanear")
+    parser.add_argument("--limit", type=int, default=500, help="Velas históricas a analizar")
+    
+    args = parser.parse_args()
+    data = scan_smc(args.symbols, args.tfs, args.limit)
+    
+    if data:
+        insert_fvgs(data)
+
+
+import ccxt
+import pandas as pd
+import numpy as np
+from scipy.signal import argrelextrema
+import argparse
+
+def fetch_ohlcv(symbol, timeframe, limit=300):
+    exchange = ccxt.binance({'enableRateLimit': True})
+    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    
+    # Conversión de UTC a Hora Local (Colombia UTC-5)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('America/Bogota')
+    
+    return df
+
+def calculate_rsi(series, period=14):
+    delta = series.diff(1)
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def check_divergences(df, order=5, historical=False, lookback_window=60):
+    """
+    lookback_window=60: Miramos hasta 60 velas atrás para encontrar 
+    el VERDADERO pico/valle institucional, ignorando el ruido del medio.
+    """
+    df['rsi'] = calculate_rsi(df['close'])
+    df = df.dropna().reset_index(drop=True)
+
+    local_max = argrelextrema(df['high'].values, np.greater_equal, order=order)[0]
+    local_min = argrelextrema(df['low'].values, np.less_equal, order=order)[0]
+
+    divergences = []
+    current_idx = len(df) - 1
+
+    # Detección Bajista (Oso)
+    for i in range(1, len(local_max)):
+        idx_current = local_max[i]
+        is_active = (current_idx - idx_current <= order + 2)
+        
+        if not historical and not is_active:
+            continue
+            
+        valid_prev_peaks = [p for p in local_max[:i] if (idx_current - p) <= lookback_window]
+        if not valid_prev_peaks: continue
+            
+        idx_major = max(valid_prev_peaks, key=lambda p: df['high'].iloc[p])
+        
+        if df['high'].iloc[idx_current] > df['high'].iloc[idx_major] and df['rsi'].iloc[idx_current] < df['rsi'].iloc[idx_major]:
+            estado = "ACTIVA 🔥" if is_active else "HISTÓRICA 🕰️"
+            divergences.append({
+                "estado": estado,
+                "tipo": "🔴 BAJISTA (Macro)",
+                "precio": df['high'].iloc[idx_current],
+                "rsi": df['rsi'].iloc[idx_current],
+                "fecha": df['timestamp'].iloc[idx_current].strftime('%Y-%m-%d %H:%M')
+            })
+
+    # Detección Alcista (Toro)
+    for i in range(1, len(local_min)):
+        idx_current = local_min[i]
+        is_active = (current_idx - idx_current <= order + 2)
+        
+        if not historical and not is_active:
+            continue
+            
+        valid_prev_valleys = [p for p in local_min[:i] if (idx_current - p) <= lookback_window]
+        if not valid_prev_valleys: continue
+            
+        idx_major = min(valid_prev_valleys, key=lambda p: df['low'].iloc[p])
+        
+        if df['low'].iloc[idx_current] < df['low'].iloc[idx_major] and df['rsi'].iloc[idx_current] > df['rsi'].iloc[idx_major]:
+            estado = "ACTIVA 🔥" if is_active else "HISTÓRICA 🕰️"
+            divergences.append({
+                "estado": estado,
+                "tipo": "🟢 ALCISTA (Macro)",
+                "precio": df['low'].iloc[idx_current],
+                "rsi": df['rsi'].iloc[idx_current],
+                "fecha": df['timestamp'].iloc[idx_current].strftime('%Y-%m-%d %H:%M')
+            })
+
+    unique_divs = {d['fecha']: d for d in divergences}.values()
+    return sorted(unique_divs, key=lambda x: x['fecha'], reverse=True)
+
+def scan_market(symbols, timeframes, historical):
+    all_db_data = []
+    for symbol in symbols:
+        print(f"\n--- 🔎 Radar RSI (Lookback Dinámico) para {symbol} ---")
+        found_any = False
+        for tf in timeframes:
+            try:
+                order = 3 if tf in ['15m', '1h'] else 5
+                df = fetch_ohlcv(symbol, tf)
+                divs = check_divergences(df, order=order, historical=historical, lookback_window=60)
+                
+                if divs:
+                    found_any = True
+                    print(f"\n[{tf}] Resultados:")
+                    for d in divs:
+                        print(f"  {d['estado']} | {d['tipo']} el {d['fecha']} | Precio: ${d['precio']:,.2f} | RSI: {d['rsi']:,.1f}")
+                        all_db_data.append({
+                            "symbol": symbol,
+                            "timeframe": tf,
+                            "state": d['estado'],
+                            "type": d['tipo'],
+                            "price": float(d['precio']),
+                            "rsi": float(d['rsi']),
+                            "divergence_date": d['fecha']
+                        })
+            except Exception as e:
+                print(f"Error procesando {tf}: {e}")
+        if not found_any:
+            print("✅ No hay divergencias macro detectadas con los parámetros actuales.")
+            
+    return all_db_data
+
+if __name__ == "__main__":
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from utils.db import insert_rsi_divergences
+
+    parser = argparse.ArgumentParser(description="Escáner Quant de Divergencias RSI")
+    parser.add_argument("--symbols", nargs="+", required=True, help="Lista de símbolos, ej: BTC/USDT ETH/USDT")
+    parser.add_argument("--tfs", nargs="+", default=['15m', '1h', '4h', '1d'], help="Temporalidades a escanear")
+    parser.add_argument("--historical", action="store_true", help="Muestra el backtesting histórico")
+    
+    args = parser.parse_args()
+    data = scan_market(args.symbols, args.tfs, args.historical)
+    
+    if data:
+        insert_rsi_divergences(data)
+
+requirements:
+pandas
+ccxt
+yfinance
+requests
+openai
+numpy
+scipy
+supabase
+python-dotenv
+
+

@@ -1,41 +1,54 @@
 # 📈 Motor Cuantitativo & Agente de Trading (Quant Trading Agent)
 
-Motor de análisis cuantitativo y sentimiento de mercado diseñado para ejecutarse en Docker (ARM/Raspberry Pi o local). Sirve como cinturón de herramientas para un agente autónomo de IA (OpenClaw).
+Motor de análisis cuantitativo y sentimiento de mercado en tiempo real. Sirve como backend para una terminal de trading institucional y como cinturón de herramientas para un agente autónomo de IA.
 
 ---
 
-## ⚙️ Arquitectura
+## ✨ Características Principales
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Docker Container                      │
-│  ┌─────────────┐  ┌─────────────┐  ┌────────────────┐  │
-│  │ sr_scanner   │  │ rsi_diverge │  │ smc_scanner    │  │
-│  │ (Muros ATR)  │  │ (Divergen.) │  │ (FVGs)         │  │
-│  └──────┬───────┘  └──────┬──────┘  └───────┬────────┘  │
-│         │                 │                  │           │
-│  ┌──────┴─────────────────┴──────────────────┴────────┐  │
-│  │              main.py (Orquestador)                 │  │
-│  │         + analyze_sentiment.py (On-Demand)         │  │
-│  └──────────────────────┬─────────────────────────────┘  │
-│                         │                                │
-│  ┌──────────────────────┴────────────────────────────┐   │
-│  │              utils/db.py → Supabase               │   │
-│  └───────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
-                          │
-              ┌───────────┴──────────────┐
-              │   Frontend (Vue 3)       │
-              │   quant-trading-ui/      │
-              └──────────────────────────┘
-```
+1. **Live Paper Trading Engine (`live_engine.py`)** 🚀 **NUEVO**
+   - Motor asíncrono en tiempo real usando websockets de Binance (`ccxt`, `websockets`).
+   - Gestión de posiciones virtuales (Entry, TP, SL, Trailing Stop) y PnL en tiempo real.
+   - Sistema de puntuación ("Scoring") que combina múltiples indicadores para entradas limpias.
+   - Manejo de estrategias como Martingala y persistencia en memoria.
+
+2. **Detector de Ondas de Elliott y Fibonacci (`elliott_scanner.py`)** 🌊 **NUEVO**
+   - ZigZag adaptativo basado en ATR (Average True Range) para filtrar ruido dinámicamente.
+   - Motor de Reglas estricto para validar Ondas Impulsivas (12345) y Correctivas (ABC).
+   - Cálculo de objetivos de Fibonacci programáticos y niveles de invalidación en tiempo real.
+   - Análisis Multi-Temporalidad (15m, 1h, 4h, 1d) concurrente.
+
+3. **Escáner de Muros de Soporte y Resistencia (`sr_scanner.py`)**
+   - Detección de zonas de liquidez usando agrupamiento espacial (clustering) de extremos fractales.
+   - Puntuación por "toques" y confluencias en múltiples temporalidades y ATR dinámico.
+
+4. **Escáner SMC y FVGs (`smc_scanner.py`)**
+   - Detección de Fair Value Gaps (FVG) no mitigados alcistas y bajistas y medición de distancia al precio actual.
+
+5. **Divergencias RSI (`rsi_divergence.py`)**
+   - Algoritmo para detectar divergencias regulares entre la acción del precio y el RSI (Wilder's Smoothing/RMA).
+
+6. **Análisis de Sentimiento IA (`analyze_sentiment.py`)**
+   - Combina más de 11 indicadores técnicos (RSI, MACD, Bollinger, OBV, etc.) con escrutinio de noticias.
+   - Utiliza OpenAI (GPT-4o) para emitir un veredicto técnico/fundamental.
+
+7. **Persistencia y Base de Datos (`utils/db.py`)**
+   - Integración nativa con **Supabase** para guardar señales, muros, divergencias y análisis de sentimiento histórico.
+
+---
+
+## ⚙️ Arquitectura Backend
+
+El sistema se divide en procesos independientes y orquestadores:
+- **API y Websockets (`api.py`)**: Sirve el feed de datos procesados en tiempo real al Frontend de Vue.
+- **Workers Bateables**: Scripts como `main.py` o los `.sh` ejecutan escaneos periódicos o bajo demanda y guardan en Supabase.
+- **Motor en Vivo (`live_engine.py`)**: Mantiene buffers en memoria de velas cerradas y ejecuta escáneres cuantitativos en paralelo mandando señales por Socket.
 
 ---
 
 ## 🚀 Setup Rápido
 
-### 1. Variables de Entorno
-Crea `.env` en la raíz:
+### 1. Variables de Entorno (`.env`)
 ```env
 OPENAI_API_KEY="sk-TU_CLAVE"
 TELEGRAM_TOKEN="TU_TOKEN_BOTFATHER"
@@ -44,99 +57,47 @@ SUPABASE_URL="https://xxx.supabase.co"
 SUPABASE_KEY="tu_anon_key"
 ```
 
-### 2. Construir Docker
+### 2. Entorno Local (Python)
 ```bash
-sudo docker build -t motor-trading .
+python -m venv venv
+.\venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-### 3. Ejecutar
+### 3. Ejecutar Live Engine (Websocket API)
 ```bash
-# Orquestador completo (Muros + FVGs + Divergencias + Confluencias)
-./run_bot.sh
-
-# Análisis de sentimiento on-demand (1 llamada GPT)
-./run_sentiment.sh --symbols BTC/USDT --timeframes 4h,1d --telegram
+cd backtesting
+python api.py
 ```
+> El servidor inicia en `http://0.0.0.0:8877` y expone el websocket de live-feed.
 
----
-
-## 🛠️ Scripts Disponibles
-
-### 🎯 `sr_scanner.py` — Muros de Soporte/Resistencia
-Detecta zonas de liquidez con clustering sobre picos/valles fractales + ATR dinámico.
+### 4. Scripts de Escaneo Individual / Docker
 ```bash
-sudo docker run --rm --env-file .env -v $(pwd):/app motor-trading \
-  python sr_scanner.py --symbols BTC/USDT --tfs 15m 1h 4h 1d 1w --limit 1000 --max 10
-```
+# Soportes y Resistencias
+python sr_scanner.py --symbols BTC/USDT --tfs 15m 1h 4h
 
-### 🔎 `rsi_divergence.py` — Divergencias RSI
-Escanea divergencias regulares con lookback dinámico.
-```bash
-sudo docker run --rm --env-file .env -v $(pwd):/app motor-trading \
-  python rsi_divergence.py --symbols BTC/USDT --tfs 15m 1h 4h 1d
-```
-
-### 🐋 `smc_scanner.py` — Fair Value Gaps (SMC)
-Detecta FVGs no mitigados y mide distancia % al precio actual.
-```bash
-sudo docker run --rm --env-file .env -v $(pwd):/app motor-trading \
-  python smc_scanner.py --symbols BTC/USDT --tfs 1h 4h 1d --limit 500
-```
-
-### 🧠 `fetch_data.py` — Sentimiento IA (Legacy)
-Motor original de sentimiento: RSI + SMA20 + noticias → GPT-4o-mini. Ejecutado por `main.py`.
-
-### 📊 `analyze_sentiment.py` — Sentimiento IA On-Demand ⭐ NUEVO
-Análisis técnico avanzado con **11 indicadores** por temporalidad + 3 veredictos (Noticias / Técnico / Combinado).
-
-```bash
-# Un solo símbolo, TFs específicos
-./run_sentiment.sh --symbols BTC/USDT --timeframes 4h,1d --telegram
-
-# Múltiples símbolos
-./run_sentiment.sh --symbols BTC/USDT,ETH/USDT --timeframes 15m,1h,4h
-
-# Solo análisis técnico (sin noticias)
-./run_sentiment.sh --symbols BTC/USDT --timeframes 1d --no-news
-
-# Todos los TFs por defecto
-./run_sentiment.sh --symbols BTC/USDT
-```
-
-**Indicadores calculados:**
-| Categoría | Indicadores |
-|---|---|
-| Trend | SMA 20, 55, 100, 200 · EMA 21 |
-| Momentum | RSI(14) · MACD(12,26,9) · Estocástico(14,3) |
-| Volatilidad | Bollinger(20,2) · ATR(14) · OBV |
-
-**Costos:** 1 sola llamada a GPT-4o-mini por invocación, sin importar cuántos TFs.
-
-### 🎼 `main.py` — Orquestador
-Ejecuta secuencialmente: SR Scanner → RSI Divergences → SMC Scanner → Confluencias → Telegram.
-```bash
-./run_bot.sh
-# Equivale a: sudo docker run --rm --env-file .env motor-trading
+# Sentimiento IA On-Demand
+./run_sentiment.sh --symbols BTC/USDT --timeframes 4h,1d
 ```
 
 ---
 
-## 📁 Estructura
+## 📁 Estructura del Proyecto
 ```
 quant-trading-agent/
-├── main.py                  # Orquestador principal
-├── analyze_sentiment.py     # Sentimiento on-demand (OpenClaw)
-├── fetch_data.py            # Sentimiento legacy
-├── sr_scanner.py            # Muros S/R con ATR
-├── rsi_divergence.py        # Divergencias RSI
-├── smc_scanner.py           # Fair Value Gaps
+├── backtesting/
+│   ├── api.py                   # Servidor FastAPI para UI
+│   ├── live_engine.py           # Motor de paper trading y websockets
+│   ├── elliott_scanner.py       # Algoritmo de Ondas de Elliott y Fibo
+│   └── test_*.py                # Scripts de simulación y barridos
+├── main.py                      # Orquestador cronjob
+├── analyze_sentiment.py         # Análisis IA OpenAI
+├── sr_scanner.py                # Soportes y Resistencias
+├── smc_scanner.py               # Fair Value Gaps
+├── rsi_divergence.py            # Divergencias RSI
 ├── utils/
-│   └── db.py                # Cliente Supabase
-├── run_bot.sh               # Ejecuta el orquestador en Docker
-├── run_sentiment.sh          # Ejecuta sentimiento on-demand en Docker
-├── Dockerfile
-├── requirements.txt
-└── .env                     # Credenciales (gitignored)
+│   └── db.py                    # Cliente Supabase
+└── README.md
 ```
 
 ---
@@ -153,12 +114,13 @@ quant-trading-agent/
 
 ---
 
-## 🚀 Roadmap
+## 🚀 Roadmap Restante
 - [x] Smart Money Concepts (FVGs)
 - [x] Soportes/Resistencias con ATR dinámico
 - [x] Divergencias RSI con lookback dinámico
-- [x] Integración Supabase
 - [x] Sentimiento IA con 11 indicadores técnicos
 - [x] Frontend Trading Suite (Vue 3 + Lightweight Charts)
-- [ ] Integración OpenClaw como agente autónomo
-- [ ] Backtesting automatizado
+- [x] Motor Paper Trading Avanzado con Websockets
+- [x] Algoritmo Ondas Elliott Multitemporal
+- [ ] Integración Ondas de Elliott y Live Data a **Agente Autónomo OpenAI**
+- [ ] Backtesting automatizado UI

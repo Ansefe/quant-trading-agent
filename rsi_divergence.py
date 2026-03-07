@@ -16,10 +16,14 @@ def fetch_ohlcv(symbol, timeframe, limit=300):
     return df
 
 def calculate_rsi(series, period=14):
+    """RSI using Wilder's RMA (matches TradingView / industry standard)."""
     delta = series.diff(1)
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    # Wilder's smoothing: EMA with com=period-1 (equivalent to alpha=1/period)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 def check_divergences(df, order=5, historical=False, lookback_window=60):

@@ -44,10 +44,13 @@ ASSET_NAMES = {
 # ──────────────────────────────────────────────────────────────
 
 def calculate_rsi(series, period=14):
+    """RSI using Wilder's RMA (matches TradingView / industry standard)."""
     delta = series.diff(1)
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 def calculate_macd(close, fast=12, slow=26, signal=9):

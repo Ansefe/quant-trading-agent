@@ -31,6 +31,7 @@ sys.path.insert(0, PARENT_DIR)
 from sr_scanner import get_fractal_extremes, cluster_levels, calculate_atr_pct
 from smc_scanner import find_unmitigated_fvgs
 from rsi_divergence import check_divergences, calculate_rsi
+from elliott_scanner import scan_elliott_waves
 
 logger = logging.getLogger("live_engine")
 
@@ -248,6 +249,12 @@ def score_confluence_live(price, sr_levels, fvgs, divergences, config):
         best = max(supports, key=lambda s: sum(TF_WEIGHTS.get(tf, 1) for tf in s.get('confluence', [])) * 100 + s.get('touches', 0))
         tf_weight = sum(TF_WEIGHTS.get(tf, 1) for tf in best.get('confluence', []))
         long_score += 5 if tf_weight >= 7 else (4 if tf_weight >= 4 else 3)
+        # Bonus for high touch count (strong institutional level)
+        touches = best.get('touches', 0)
+        if touches >= 8:
+            long_score += 2
+        elif touches >= 5:
+            long_score += 1
         long_details.update({
             'support': round(best['price_level'], 2),
             'touches': best.get('touches', 0),
@@ -267,7 +274,7 @@ def score_confluence_live(price, sr_levels, fvgs, divergences, config):
         long_details['fvg_target'] = round(best_fvg['center_price'], 2)
         long_details['fvg_tf'] = best_fvg.get('tf', '?')
 
-    if long_score >= 5 and supports:
+    if long_score >= 4 and supports:
         if require_divergence == 'on' and not rsi_bull:
             pass
         else:
@@ -285,6 +292,12 @@ def score_confluence_live(price, sr_levels, fvgs, divergences, config):
         best = max(resistances, key=lambda r: sum(TF_WEIGHTS.get(tf, 1) for tf in r.get('confluence', [])) * 100 + r.get('touches', 0))
         tf_weight = sum(TF_WEIGHTS.get(tf, 1) for tf in best.get('confluence', []))
         short_score += 5 if tf_weight >= 7 else (4 if tf_weight >= 4 else 3)
+        # Bonus for high touch count (strong institutional level)
+        touches = best.get('touches', 0)
+        if touches >= 8:
+            short_score += 2
+        elif touches >= 5:
+            short_score += 1
         short_details.update({
             'resistance': round(best['price_level'], 2),
             'touches': best.get('touches', 0),
@@ -304,7 +317,7 @@ def score_confluence_live(price, sr_levels, fvgs, divergences, config):
         short_details['fvg_target'] = round(best_fvg['center_price'], 2)
         short_details['fvg_tf'] = best_fvg.get('tf', '?')
 
-    if short_score >= 5 and resistances:
+    if short_score >= 4 and resistances:
         if require_divergence == 'on' and not rsi_bear:
             pass
         else:
@@ -694,6 +707,20 @@ class LivePaperEngine:
 
         current_time = pd.Timestamp.now()
         self.cached_divs = await loop.run_in_executor(None, scan_divergences_from_buffers, self.buffers, current_time)
+
+        # ── Multi-TF Elliott Wave Scan ──
+        elliott_results = {}
+        for tf in ['15m', '1h', '4h', '1d', '1w']:
+            if tf in self.buffers and len(self.buffers[tf]) > 50:
+                df_tf = self.buffers[tf]
+                payload = await loop.run_in_executor(
+                    None, lambda d=df_tf: scan_elliott_waves(d, current_price, atr_multiplier=1.8))
+                
+                if payload:
+                    elliott_results[tf] = payload
+
+        if elliott_results:
+            await self._emit('elliott_wave_update', elliott_results)
 
         sr_multi = len([l for l in self.cached_sr if len(l.get('confluence', [])) >= 2])
         logger.info(f"   📊 Scan #{self._candle_count_15m}: SR={len(self.cached_sr)} ({sr_multi} multi-TF) | FVG={len(self.cached_fvgs)} | DIV={len(self.cached_divs)}")
